@@ -484,7 +484,9 @@ if "staff_df" not in st.session_state:
             if col in loaded_df.columns:
                 # Convert to string, strip any accidental '.0' from the end, and clear 'nan'
                 loaded_df[col] = loaded_df[col].astype(str).str.replace(r'\.0$', '', regex=True).replace('nan', '')     
-        loaded_df.fillna("", inplace=True)
+        for col in loaded_df.columns:
+            if loaded_df[col].dtype == 'object':
+                loaded_df[col] = loaded_df[col].fillna("")
         st.session_state.staff_df = loaded_df
     else:
         st.session_state.staff_df = load_initial_staff()
