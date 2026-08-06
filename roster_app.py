@@ -463,30 +463,31 @@ if "staff_df" not in st.session_state:
     if os.path.exists("staff_profiles.csv"):
         loaded_df = pd.read_csv("staff_profiles.csv")
         
-        if "Secondary_Role" not in loaded_df.columns:
-            loaded_df["Secondary_Role"] = "None"
-        if "Secondary_EFT" not in loaded_df.columns:
-            loaded_df["Secondary_EFT"] = 0.0
-        if "No_AM_DOW" not in loaded_df.columns:
-            loaded_df["No_AM_DOW"] = ""
-        if "No_PM_DOW" not in loaded_df.columns:
-            loaded_df["No_PM_DOW"] = ""
-        if "Preferred_Shift" not in loaded_df.columns:
-            loaded_df["Preferred_Shift"] = "None"
-        if "Study_Leave_Days" not in loaded_df.columns:
-            loaded_df["Study_Leave_Days"] = ""
-        if "External_Working_Days" not in loaded_df.columns:
-            loaded_df["External_Working_Days"] = ""
-       
-# --- THE FIX: Stop Pandas from turning days into decimals (1.0) ---
-        text_columns = ["Approved_Leave_Days", "Requested_RDOs", "Study_Leave_Days", "External_Working_Days"]
-        for col in text_columns:
+        # 1. Inject missing columns for older save files
+        if "Secondary_Role" not in loaded_df.columns: loaded_df["Secondary_Role"] = "None"
+        if "Secondary_EFT" not in loaded_df.columns: loaded_df["Secondary_EFT"] = 0.0
+        if "No_AM_DOW" not in loaded_df.columns: loaded_df["No_AM_DOW"] = ""
+        if "No_PM_DOW" not in loaded_df.columns: loaded_df["No_PM_DOW"] = ""
+        if "Preferred_Shift" not in loaded_df.columns: loaded_df["Preferred_Shift"] = "None"
+        if "Study_Leave_Days" not in loaded_df.columns: loaded_df["Study_Leave_Days"] = ""
+        if "External_Working_Days" not in loaded_df.columns: loaded_df["External_Working_Days"] = ""
+            
+        # 2. BULLETPROOF TYPE CASTING: Force Checkboxes to be True/False Booleans
+        bool_cols = ["Night_Pool", "Allow_Fragmented_Shifts", "Entire_Roster_Leave"]
+        for col in bool_cols:
             if col in loaded_df.columns:
-                # Convert to string, strip any accidental '.0' from the end, and clear 'nan'
-                loaded_df[col] = loaded_df[col].astype(str).str.replace(r'\.0$', '', regex=True).replace('nan', '')     
+                loaded_df[col] = loaded_df[col].astype(str).str.lower().isin(['true', '1', 't'])
+
+        # 3. Force Numbers to be Decimals/Integers (fallback to default if blank)
+        loaded_df["EFT"] = pd.to_numeric(loaded_df["EFT"], errors='coerce').fillna(1.0)
+        loaded_df["Secondary_EFT"] = pd.to_numeric(loaded_df["Secondary_EFT"], errors='coerce').fillna(0.0)
+        loaded_df["Prior_Consecutive_Days"] = pd.to_numeric(loaded_df["Prior_Consecutive_Days"], errors='coerce').fillna(0).astype(int)
+
+        # 4. Force everything else to be safe Text
         for col in loaded_df.columns:
-            if loaded_df[col].dtype == 'object':
-                loaded_df[col] = loaded_df[col].fillna("")
+            if col not in bool_cols and col not in ["EFT", "Secondary_EFT", "Prior_Consecutive_Days"]:
+                loaded_df[col] = loaded_df[col].astype(str).str.replace(r'\.0$', '', regex=True).replace('nan', '')
+        
         st.session_state.staff_df = loaded_df
     else:
         st.session_state.staff_df = load_initial_staff()
