@@ -2,3 +2,4 @@ streamlit
 pandas
 holidays
 ortools
+st-gsheets-connection
