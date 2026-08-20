@@ -37,7 +37,9 @@ def load_initial_staff():
             "No_PM_DOW": "",
             "Preferred_Shift": "None",
             "Study_Leave_Days": "",
-            "External_Working_Days": "" # e.g., CNM shifts, secondments
+            "External_Working_Days": "",
+            "W1_Preferences": "",
+            "W2_Preferences": ""
         })
         
     return pd.DataFrame(staff_data)
@@ -114,6 +116,8 @@ def solve_roster(df, num_days, start_date):
             model.Add(night_sum <= 4)
             
     # CONSTRAINT: Skill Mix & Demographics
+    leadership_penalties = []
+    
     for d in all_days:
         for s in range(3):
             model.Add(sum(roster[(n, d, s)] for n in females if (n, d, s) in roster) >= 1)
@@ -133,12 +137,17 @@ def solve_roster(df, num_days, start_date):
                 sum(role_secondary[(n, d, s)] for n in all_staff if df.iloc[n]["Secondary_Role"] == "EN/Learner" and (n, d, s) in role_secondary)
             )
             
+            # --- Leadership Constraints (All Shifts) ---
+            # 1. Hard rule: Max 1 ANUM per shift
+            model.Add(anum_sum <= 1)
+            
+            # 2. Hard rule: Total leadership coverage must be at least 2 
             model.Add(anum_sum + rn_in_charge_sum >= 2)
             
-            if s == 2:
-                model.Add(en_sum <= 1)
-            else:
-                model.Add(en_sum <= 2)
+            # 3. Soft rule: Ideally 1 ANUM per shift. Create a penalty if it drops to 0.
+            missing_anum = model.NewIntVar(0, 1, f'missing_anum_d{d}_s{s}')
+            model.Add(missing_anum == 1 - anum_sum)
+            leadership_penalties.append(missing_anum * 15)
             
     # CONSTRAINT: Night Pool vs Day Pool Separation
     for n in all_staff:
@@ -186,7 +195,8 @@ def solve_roster(df, num_days, start_date):
                 if day_name in dow_str:
                     for s in range(3):
                         model.Add(roster[(n, d, s)] == 0)
-# Block specific shift unavailabilities (e.g., "Cannot work Monday AM")
+
+        # Block specific shift unavailabilities (e.g., "Cannot work Monday AM")
         no_am_str = str(df.iloc[n].get("No_AM_DOW", "")).lower()
         no_pm_str = str(df.iloc[n].get("No_PM_DOW", "")).lower()
         
@@ -238,9 +248,8 @@ def solve_roster(df, num_days, start_date):
             # Calculate Standard Leave
             leave_hours_deduction = valid_leave_days * shift_length
             
-            # NEW: Calculate Study Leave (Strictly 8 hours per day)
+            # Calculate Study Leave (Strictly 8 hours per day)
             study_str = str(df.iloc[n].get("Study_Leave_Days", ""))
-            # We re-parse here quickly safely
             study_count = 0
             if study_str and study_str.lower() != 'nan':
                 for val in study_str.split(","):
@@ -250,7 +259,7 @@ def solve_roster(df, num_days, start_date):
                     
             study_hours_deduction = study_count * 8.0
             
-            # Adjust the final targets!
+            # Adjust the final targets
             adjusted_target_hours = max(0, target_hours - leave_hours_deduction - study_hours_deduction)
             final_shift_target = math.ceil(adjusted_target_hours / shift_length)
             
@@ -318,42 +327,118 @@ def solve_roster(df, num_days, start_date):
                 for s in range(3):
                     model.Add(roster[(n, 1, s)] == 0)
                     
-        # 4. Maximum 2 Blocks of Shifts Per Fortnight
+        # 4. Maximum 2 Blocks of Shifts Per Fortnight (Count Block Starts instead of ends)
         allow_fragmented = df.iloc[n]["Allow_Fragmented_Shifts"]
         
-        for start_d in range(0, num_days, 14):
-            end_d = min(start_d + 14, num_days)
-            block_ends = []
+        if not allow_fragmented:
+            block_starts = []
             
-            for d in range(start_d, end_d - 1):
-                working_today = sum(roster[(n, d, s)] for s in range(3) if (n, d, s) in roster) + (1 if d in virtual_days else 0)
-                working_tomorrow = sum(roster[(n, d+1, s)] for s in range(3) if (n, d+1, s) in roster) + (1 if d+1 in virtual_days else 0)
+            # Check for transitions from OFF to WORKING (Days 1 to 13)
+            for d in range(1, num_days):
+                w_yest = sum(roster[(n, d-1, s)] for s in range(3) if (n, d-1, s) in roster) + (1 if d-1 in virtual_days else 0)
+                w_tod = sum(roster[(n, d, s)] for s in range(3) if (n, d, s) in roster) + (1 if d in virtual_days else 0)
                 
-                is_end_of_block = model.NewBoolVar(f'block_end_staff_{n}_day_{d}')
-                model.Add(working_today - working_tomorrow <= is_end_of_block)
-                block_ends.append(is_end_of_block)
+                is_start = model.NewBoolVar(f'block_start_staff_{n}_day_{d}')
+                model.Add(w_tod - w_yest <= is_start)
+                block_starts.append(is_start)
                 
-            if not allow_fragmented:
-                model.Add(sum(block_ends) <= 2)
+            # Check Day 0 (Only counts as a start if they were OFF on the previous roster)
+            w0 = sum(roster[(n, 0, s)] for s in range(3) if (n, 0, s) in roster) + (1 if 0 in virtual_days else 0)
+            is_start_0 = model.NewBoolVar(f'block_start_staff_{n}_day_0')
+            if prior_days == 0:
+                model.Add(w0 <= is_start_0)
+            else:
+                # Continuation from last roster, doesn't count against this fortnight's max
+                model.Add(0 <= is_start_0)
                 
-        # 5. Minimum 2 Days Off at a Time (Ban single days off)
+            block_starts.append(is_start_0)
+            
+            # Enforce max 2 starts per fortnight
+            model.Add(sum(block_starts) <= 2)
+                
+        # 5. Minimum 2 Days Off AND Minimum 2 Working Days (Ban all fragmentation)
         if not allow_fragmented:
             for d in range(num_days - 2):
-                working_d = sum(roster[(n, d, s)] for s in range(3) if (n, d, s) in roster) + (1 if d in virtual_days else 0)
-                working_d1 = sum(roster[(n, d+1, s)] for s in range(3) if (n, d+1, s) in roster) + (1 if d+1 in virtual_days else 0)
-                working_d2 = sum(roster[(n, d+2, s)] for s in range(3) if (n, d+2, s) in roster) + (1 if d+2 in virtual_days else 0)
+                w0 = sum(roster[(n, d, s)] for s in range(3) if (n, d, s) in roster) + (1 if d in virtual_days else 0)
+                w1 = sum(roster[(n, d+1, s)] for s in range(3) if (n, d+1, s) in roster) + (1 if d+1 in virtual_days else 0)
+                w2 = sum(roster[(n, d+2, s)] for s in range(3) if (n, d+2, s) in roster) + (1 if d+2 in virtual_days else 0)
                 
-                model.Add(working_d - working_d1 + working_d2 <= 1)
+                # Ban Single Day Off (Pattern: 1 -> 0 -> 1)
+                model.Add(w0 - w1 + w2 <= 1)
                 
+                # Ban Single Working Shift (Pattern: 0 -> 1 -> 0)
+                model.Add(w1 - w0 - w2 <= 0)
+                
+            # Edge Cases for the boundaries (Start of Roster)
+            w0 = sum(roster[(n, 0, s)] for s in range(3) if (n, 0, s) in roster) + (1 if 0 in virtual_days else 0)
+            w1 = sum(roster[(n, 1, s)] for s in range(3) if (n, 1, s) in roster) + (1 if 1 in virtual_days else 0)
+            
+            # If no shifts on prior roster, working Day 0 means they MUST work Day 1 (Ban single shift at start)
+            if prior_days == 0 and num_days > 1:
+                model.Add(w0 - w1 <= 0)
+                
+            # If they worked prior roster, taking Day 0 off means they MUST take Day 1 off (Ban single day off at start)
             if prior_days > 0 and num_days > 1:
-                working_day_0 = sum(roster[(n, 0, s)] for s in range(3) if (n, 0, s) in roster) + (1 if 0 in virtual_days else 0)
-                working_day_1 = sum(roster[(n, 1, s)] for s in range(3) if (n, 1, s) in roster) + (1 if 1 in virtual_days else 0)
-                model.Add(working_day_1 <= working_day_0)
+                model.Add(w1 <= w0)
 
-    # OPTIMIZATION: Soft Constraints (Fatigue & Fairness)
+    # OPTIMIZATION: Soft Constraints
+    shift_mix_penalties = []
+    granular_penalties = []
     penalties = []
-    
+
+    day_map = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    shift_map = {"am": 0, "pm": 1, "night": 2}
+
     for n in all_staff:
+        # 1. Granular Shift Preferences (Rewards)
+        w1_str = str(df.iloc[n].get("W1_Preferences", "")).lower()
+        w2_str = str(df.iloc[n].get("W2_Preferences", "")).lower()
+
+        # Check Week 1 (Days 0-6) and Week 2 (Days 7-13)
+        for week_offset, pref_str in [(0, w1_str), (7, w2_str)]:
+            if not pref_str or pref_str == 'nan': 
+                continue
+                
+            requests = [x.strip() for x in pref_str.split(",")]
+            for req in requests:
+                parts = req.split()
+                if len(parts) >= 2:
+                    d_str = parts[0][:3] 
+                    s_str = parts[1]
+                    
+                    if d_str in day_map and s_str in shift_map:
+                        target_day = day_map[d_str] + week_offset
+                        target_shift = shift_map[s_str]
+                        
+                        if target_day < num_days and (n, target_day, target_shift) in roster:
+                            # Add a -10 negative penalty (a reward) to highly incentivize this shift
+                            granular_penalties.append(-10 * roster[(n, target_day, target_shift)])
+
+        # 2. General AM/PM Balance
+        if not df.iloc[n].get("Night_Pool", False):
+            pref = str(df.iloc[n].get("Preferred_Shift", "None")).strip()
+            
+            am_shifts = sum(roster[(n, d, 0)] for d in range(num_days) if (n, d, 0) in roster)
+            pm_shifts = sum(roster[(n, d, 1)] for d in range(num_days) if (n, d, 1) in roster)
+            
+            dev = model.NewIntVar(0, 100, f'shift_balance_dev_{n}')
+            
+            if pref.upper() == "PM":
+                model.Add(dev >= pm_shifts - (3 * am_shifts))
+                model.Add(dev >= -(pm_shifts - (3 * am_shifts)))
+                shift_mix_penalties.append(dev * 2) 
+                
+            elif pref.upper() == "AM":
+                model.Add(dev >= am_shifts - (3 * pm_shifts))
+                model.Add(dev >= -(am_shifts - (3 * pm_shifts)))
+                shift_mix_penalties.append(dev * 2)
+                
+            else:
+                model.Add(dev >= am_shifts - pm_shifts)
+                model.Add(dev >= -(am_shifts - pm_shifts))
+                shift_mix_penalties.append(dev * 4) 
+
+        # 3. Fatigue & Fairness Limits
         late_earlies = []
         for d in range(num_days - 1):
             is_late_early = model.NewBoolVar(f'late_early_staff_{n}_day_{d}')
@@ -378,21 +463,17 @@ def solve_roster(df, num_days, start_date):
                 model.Add(window_sum - ideal_max_consecutive <= over_consecutive)
                 penalties.append(over_consecutive * 5)
 
-# 3. Maximize Preferred Shifts
+        # 4. Maximize Preferred Shifts
         pref_shift = str(df.iloc[n].get("Preferred_Shift", "None"))
         if pref_shift in ["AM", "PM", "Night"]:
-            pref_idx = shift_names.index(pref_shift) # Finds if it's 0, 1, or 2
-            
+            pref_idx = shift_names.index(pref_shift)
             for d in range(num_days):
                 for s in range(3):
-                    # If this shift exists, and it is NOT their preferred shift...
                     if s != pref_idx and (n, d, s) in roster:
-                        # Add a small penalty (e.g., weight of 2) to discourage the engine.
-                        # Because it's a soft constraint, the engine will still break this rule 
-                        # if the ward absolutely needs them to fill a quota!
                         penalties.append(roster[(n, d, s)] * 2)
 
-    model.Minimize(sum(penalties))                
+    # Feed ALL penalties and rewards into the final optimization
+    model.Minimize(sum(shift_mix_penalties) + sum(penalties) + sum(granular_penalties) + sum(leadership_penalties))              
     
     # EXECUTE THE SOLVER
     solver = cp_model.CpSolver()
@@ -401,6 +482,30 @@ def solve_roster(df, num_days, start_date):
     
     # FORMAT THE OUTPUT
     if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+        # --- PRE-PROCESS: Identify Acting Shift Leaders ---
+        acting_leaders = set()
+        for d in all_days:
+            for s in range(3):
+                anum_present = False
+                rn_in_charges = []
+                
+                for n in all_staff:
+                    if (n, d, s) in roster and solver.Value(roster[(n, d, s)]) == 1:
+                        # What role are they playing today?
+                        active_role = df.iloc[n]["Role"]
+                        if (n, d, s) in role_secondary and solver.Value(role_secondary[(n, d, s)]) == 1:
+                            active_role = df.iloc[n]["Secondary_Role"]
+                            
+                        if active_role == "ANUM":
+                            anum_present = True
+                        elif active_role == "RN (In Charge)":
+                            rn_in_charges.append(n)
+                            
+                # If no ANUM is on the shift, the first RN (In Charge) steps up
+                if not anum_present and len(rn_in_charges) > 0:
+                    acting_leaders.add((rn_in_charges[0], d, s))
+        # --------------------------------------------------
+
         roster_output = []
         
         day_headers = []
@@ -420,7 +525,6 @@ def solve_roster(df, num_days, start_date):
             for d in all_days:
                 assigned_shift = "" 
                 
-                # Check if we need to print "Study Leave"
                 study_str = str(df.iloc[n].get("Study_Leave_Days", ""))
                 study_days = []
                 if study_str and study_str.lower() != 'nan':
@@ -437,6 +541,10 @@ def solve_roster(df, num_days, start_date):
                                 assigned_shift = f"{shift_names[s]} ({df.iloc[n]['Secondary_Role']})"
                             else:
                                 assigned_shift = shift_names[s]
+                                
+                            # Tag them if they were drafted as the ANUM replacement
+                            if (n, d, s) in acting_leaders:
+                                assigned_shift += " (Shift Leader)"
                 
                 staff_row[day_headers[d]] = assigned_shift
                 
@@ -469,13 +577,21 @@ if "staff_df" not in st.session_state:
 raw_df = st.session_state.staff_df.copy()
 
 # 1. Inject missing columns
-if "Secondary_Role" not in raw_df.columns: raw_df["Secondary_Role"] = "None"
-if "Secondary_EFT" not in raw_df.columns: raw_df["Secondary_EFT"] = 0.0
-if "No_AM_DOW" not in raw_df.columns: raw_df["No_AM_DOW"] = ""
-if "No_PM_DOW" not in raw_df.columns: raw_df["No_PM_DOW"] = ""
-if "Preferred_Shift" not in raw_df.columns: raw_df["Preferred_Shift"] = "None"
-if "Study_Leave_Days" not in raw_df.columns: raw_df["Study_Leave_Days"] = ""
-if "External_Working_Days" not in raw_df.columns: raw_df["External_Working_Days"] = ""
+missing_columns = {
+    "Secondary_Role": "None",
+    "Secondary_EFT": 0.0,
+    "No_AM_DOW": "",
+    "No_PM_DOW": "",
+    "Preferred_Shift": "None",
+    "Study_Leave_Days": "",
+    "External_Working_Days": "",
+    "W1_Preferences": "",
+    "W2_Preferences": ""
+}
+
+for col, default_val in missing_columns.items():
+    if col not in raw_df.columns:
+        raw_df[col] = default_val
 
 # 2. Force Checkboxes to Boolean
 bool_cols = ["Night_Pool", "Allow_Fragmented_Shifts", "Entire_Roster_Leave"]
@@ -517,7 +633,9 @@ edited_df = st.data_editor(
         "No_PM_DOW": st.column_config.TextColumn("No PM Days (e.g. Tuesday, Friday)"),
         "Preferred_Shift": st.column_config.SelectboxColumn("Preferred Shift", options=["None", "AM", "PM", "Night"]),
         "Study_Leave_Days": st.column_config.TextColumn("Study Leave (e.g. 5, 12)"),
-        "External_Working_Days": st.column_config.TextColumn("External/CNM Days (e.g. 3, 4, 5)")
+        "External_Working_Days": st.column_config.TextColumn("External/CNM Days (e.g. 3, 4, 5)"),
+        "W1_Preferences": st.column_config.TextColumn("W1 Prefs (e.g. Mon AM, Tue PM)"),
+        "W2_Preferences": st.column_config.TextColumn("W2 Prefs (e.g. Wed Night)")
     }
 )
 
