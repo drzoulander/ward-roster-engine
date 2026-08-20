@@ -7,6 +7,31 @@ import math
 from ortools.sat.python import cp_model
 from streamlit_gsheets import GSheetsConnection
 
+# --- PASSWORD PROTECTION ---
+def check_password():
+    """Returns True if the user had the correct password."""
+    if "password_correct" not in st.session_state:
+        st.session_state["password_correct"] = False
+
+    if not st.session_state["password_correct"]:
+        st.title("Ward Rostering Engine")
+        st.text_input("Please enter the password to access the engine:", type="password", key="pwd")
+        
+        if st.session_state["pwd"]:
+            # Check against the secret password stored in Streamlit Cloud
+            if st.session_state["pwd"] == st.secrets["app_password"]:
+                st.session_state["password_correct"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+        return False
+    return True
+
+# Stop the app completely if the password is wrong or hasn't been entered
+if not check_password():
+    st.stop()
+# ---------------------------
+
 # ----------------------------------------
 # 1. INITIALIZE MOCK DATA
 # ----------------------------------------
