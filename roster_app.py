@@ -5,6 +5,7 @@ import datetime
 import holidays
 import math
 from ortools.sat.python import cp_model
+from streamlit_gsheets import GSheetsConnection
 
 # ----------------------------------------
 # 1. INITIALIZE MOCK DATA
@@ -567,10 +568,24 @@ with st.sidebar:
     start_date = st.date_input("Roster Start Date", datetime.date.today())
     roster_days = st.slider("Roster Length (Days)", min_value=14, max_value=182, value=14, step=7)
 
+# --- GOOGLE SHEETS CONNECTION ---
+conn = st.connection("gsheets", type=GSheetsConnection)
+SHEET_URL = "https://docs.google.com/spreadsheets/d/12MZmbtrC6q2llsY-V-mAzzgJ4asizPe3TV0U6_DsmGY/edit?gid=0#gid=0"
+
 if "staff_df" not in st.session_state:
-    if os.path.exists("staff_profiles.csv"):
-        st.session_state.staff_df = pd.read_csv("staff_profiles.csv")
-    else:
+    try:
+        # Pull data directly from the cloud
+        pulled_df = conn.read(spreadsheet=SHEET_URL)
+        # Google Sheets sometimes adds invisible empty rows at the bottom; this cleans them
+        pulled_df = pulled_df.dropna(how="all")
+        
+        # If it is a brand new blank sheet, load the default template instead
+        if pulled_df.empty or "ID" not in pulled_df.columns:
+            st.session_state.staff_df = load_initial_staff()
+        else:
+            st.session_state.staff_df = pulled_df
+    except Exception:
+        # Fallback just in case the internet blinks
         st.session_state.staff_df = load_initial_staff()
 
 # --- FORCE CLEAN DATA TYPES (Bypasses Memory Caching Bugs) ---
@@ -640,8 +655,10 @@ edited_df = st.data_editor(
 )
 
 if st.button("Save Staff Profiles"):
-    edited_df.to_csv("staff_profiles.csv", index=False)
-    st.success("Staff profiles saved successfully! They will load automatically next time.")
+    with st.spinner("Saving securely to Google Sheets..."):
+        conn.update(spreadsheet=SHEET_URL, data=edited_df)
+        st.session_state.staff_df = edited_df
+    st.success("Staff profiles permanently saved to the Cloud!")
 
 if st.button("Generate Roster", type="primary"):
     with st.spinner("Calculating optimal shifts (this may take a few seconds)..."):
