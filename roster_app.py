@@ -82,6 +82,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
             
     females = df.index[df['Gender'] == 'Female'].tolist()
 
+    # --- UPDATED: ELASTIC COVERAGE MATH ---
     end_date = start_date + datetime.timedelta(days=num_days)
     vic_holidays = holidays.AU(subdiv='VIC', years=[start_date.year, end_date.year])
     
@@ -90,20 +91,37 @@ def solve_roster(df, num_days, start_date, debug_flags):
     for d in all_days:
         current_date = start_date + datetime.timedelta(days=d)
         is_weekend = current_date.weekday() >= 5
+        is_monday = current_date.weekday() == 0
         is_friday = current_date.weekday() == 4
         is_pub_hol = current_date in vic_holidays
         
+        # 1. AM SHIFT (s=0)
+        am_sum = sum(roster[(n, d, 0)] for n in all_staff)
         if not debug_flags.get("ignore_coverage"):
-            model.Add(sum(roster[(n, d, 0)] for n in all_staff) == 5)
+            if is_weekend or is_monday or is_pub_hol:
+                # Wiggle room: Ideally 5, Absolute Minimum 4
+                model.Add(am_sum >= 4)
+                model.Add(am_sum <= 5)
+                missing_am = model.NewIntVar(0, 1, f'missing_am_d{d}')
+                model.Add(missing_am == 5 - am_sum)
+                # Penalty 40: Overrides RDOs (30), respects Fatigue (50+)
+                staffing_level_penalties.append(missing_am * 40)
+            else:
+                model.Add(am_sum == 5)
         
+        # 2. PM SHIFT (s=1)
         pm_sum = sum(roster[(n, d, 1)] for n in all_staff)
         if not debug_flags.get("ignore_coverage"):
-            if is_weekend or is_friday or is_pub_hol:
-                model.Add(pm_sum == 5)
-            else:
-                model.Add(pm_sum >= 4)
-                model.Add(pm_sum <= 5)
+            # Global PM wiggle room: all PMs can drop to 4 if absolutely necessary
+            model.Add(pm_sum >= 4)
+            model.Add(pm_sum <= 5)
             
+            if is_weekend or is_friday or is_pub_hol:
+                missing_pm = model.NewIntVar(0, 1, f'missing_pm_d{d}')
+                model.Add(missing_pm == 5 - pm_sum)
+                staffing_level_penalties.append(missing_pm * 40)
+            
+        # 3. NIGHT SHIFT (s=2)
         night_sum = sum(roster[(n, d, 2)] for n in all_staff)
         if not debug_flags.get("ignore_coverage"):
             model.Add(night_sum >= 3)
@@ -112,7 +130,8 @@ def solve_roster(df, num_days, start_date, debug_flags):
             if is_weekend or is_pub_hol:
                 missing_weekend_night = model.NewIntVar(0, 1, f'missing_wknd_night_d{d}')
                 model.Add(missing_weekend_night == 4 - night_sum)
-                staffing_level_penalties.append(missing_weekend_night * 10)
+                staffing_level_penalties.append(missing_weekend_night * 40)
+    # --------------------------------------
             
     leadership_penalties = []
     
@@ -517,7 +536,6 @@ with st.sidebar:
 
 # --- GOOGLE SHEETS CONNECTION ---
 conn = st.connection("gsheets", type=GSheetsConnection)
-# REPLACE WITH YOUR ACTUAL URL!
 SHEET_URL = "Ward Staff Profiles" 
 
 if "staff_df" not in st.session_state:
