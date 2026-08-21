@@ -296,7 +296,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(roster[(n, 0, 0)] == 0)
                 model.Add(roster[(n, 0, 1)] == 0)
                 
-            # --- UPDATED: Dynamic Maximum Consecutive Shifts ---
+            # --- UPDATED: Dynamic Maximum Consecutive Shifts (SOFT CONSTRAINT) ---
             shift_length = 10.0 if is_night_pool else 8.0
             shifts_per_fortnight = math.ceil((df.iloc[n]["EFT"] * 80.0) / shift_length)
             max_consec = int((shifts_per_fortnight / 2) + 1)
@@ -304,20 +304,29 @@ def solve_roster(df, num_days, start_date, debug_flags):
             for d in range(num_days - max_consec):
                 ward_shifts = sum(roster[(n, d+w, s)] for w in range(max_consec + 1) for s in range(3) if (n, d+w, s) in roster)
                 virtual_shifts = sum(1 for w in range(max_consec + 1) if (d+w) in virtual_days)
-                model.Add(ward_shifts + virtual_shifts <= max_consec)
                 
-            # Max 4 Night Shifts in a row safety net
+                # Make this a soft constraint. If RDOs force them to work too many days, allow it with a heavy penalty!
+                over_limit = model.NewIntVar(0, 14, f'over_consec_{n}_{d}')
+                model.Add(ward_shifts + virtual_shifts - max_consec <= over_limit)
+                fatigue_penalties.append(over_limit * 50)
+                
+            # Max 4 Night Shifts in a row safety net (Kept as a HARD constraint for safety)
             for d in range(num_days - 4):
                 model.Add(sum(roster[(n, d+w, 2)] for w in range(5)) <= 4)
                 
-            # Boundary Consecutive Shifts with dynamic math
+            # Boundary Consecutive Shifts with dynamic math (SOFT CONSTRAINT)
             if prior_days > 0:
                 days_to_check = (max_consec + 1) - prior_days
                 remaining_allowed = max(0, max_consec - prior_days)
                 if days_to_check > 0 and num_days >= days_to_check:
                     ward_boundary = sum(roster[(n, w, s)] for w in range(days_to_check) for s in range(3) if (n, w, s) in roster)
                     virtual_boundary = sum(1 for w in range(days_to_check) if w in virtual_days)
-                    model.Add(ward_boundary + virtual_boundary <= remaining_allowed)
+                    
+                    over_boundary = model.NewIntVar(0, 14, f'over_bound_{n}')
+                    model.Add(ward_boundary + virtual_boundary - remaining_allowed <= over_boundary)
+                    fatigue_penalties.append(over_boundary * 50)
+
+            # 3. The 48-Hour Transition Rule
 
             # 3. The 48-Hour Transition Rule
             if last_shift == "Night" and not is_night_pool:
