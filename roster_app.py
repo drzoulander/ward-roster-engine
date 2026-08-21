@@ -599,6 +599,9 @@ if "staff_df" not in st.session_state:
 # --- FORCE CLEAN DATA TYPES ---
 raw_df = st.session_state.staff_df.copy()
 
+# 1. Brutally strip any invisible spaces from Google Sheet column names
+raw_df.columns = raw_df.columns.str.strip()
+
 missing_columns = {
     "Secondary_Role": "None",
     "Secondary_EFT": 0.0,
@@ -615,19 +618,26 @@ for col, default_val in missing_columns.items():
     if col not in raw_df.columns:
         raw_df[col] = default_val
 
-# Brute-force boolean parser to handle Google Sheets mixed types
+# 2. The Bulletproof Boolean Parser
 def make_boolean(val):
     if pd.isna(val): 
         return False
     if isinstance(val, bool): 
         return val
-    return str(val).strip().lower() in ['true', '1', 't', 'yes', 'y']
+    
+    # Convert absolutely anything Google sends into a loud, uppercase string
+    val_str = str(val).strip().upper()
+    if val_str in ['TRUE', '1', '1.0', 'T', 'YES', 'Y']:
+        return True
+    return False
 
 bool_cols = ["Night_Pool", "Allow_Fragmented_Shifts", "Entire_Roster_Leave"]
 for col in bool_cols:
     if col not in raw_df.columns:
         raw_df[col] = False
-    raw_df[col] = raw_df[col].apply(make_boolean)
+        
+    # Apply the parser AND force the entire column to be a strict Python boolean type
+    raw_df[col] = raw_df[col].apply(make_boolean).astype(bool)
 
 raw_df["EFT"] = pd.to_numeric(raw_df["EFT"], errors='coerce').fillna(1.0)
 raw_df["Secondary_EFT"] = pd.to_numeric(raw_df["Secondary_EFT"], errors='coerce').fillna(0.0)
