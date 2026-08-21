@@ -583,7 +583,7 @@ with st.sidebar:
 # --- GOOGLE SHEETS CONNECTION ---
 conn = st.connection("gsheets", type=GSheetsConnection)
 # REPLACE WITH YOUR ACTUAL URL!
-SHEET_URL = "PASTE_YOUR_LONG_GOOGLE_SHEETS_URL_HERE" 
+SHEET_URL = "Ward Staff Profiles" 
 
 if "staff_df" not in st.session_state:
     try:
