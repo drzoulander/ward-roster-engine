@@ -672,8 +672,21 @@ col1, col2 = st.columns(2)
 with col1:
     if st.button("Save Staff Profiles"):
         with st.spinner("Saving securely to Google Sheets..."):
-            conn.update(spreadsheet=SHEET_URL, data=edited_df)
+            
+            # --- GOOGLE SHEETS BOOLEAN FIX ---
+            # Create a temporary copy of the data just for saving
+            save_df = edited_df.copy()
+            bool_cols = ["Night_Pool", "Allow_Fragmented_Shifts", "Entire_Roster_Leave"]
+            
+            # Force all checkboxes into literal text strings so Google Sheets accepts them
+            for col in bool_cols:
+                if col in save_df.columns:
+                    save_df[col] = save_df[col].astype(str).str.upper()
+            # ---------------------------------
+            
+            conn.update(spreadsheet=SHEET_URL, data=save_df)
             st.session_state.staff_df = edited_df
+            
         st.success("Staff profiles permanently saved to the Cloud!")
 
 with col2:
