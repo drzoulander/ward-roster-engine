@@ -595,7 +595,7 @@ with st.sidebar:
 
 # --- GOOGLE SHEETS CONNECTION ---
 conn = st.connection("gsheets", type=GSheetsConnection)
-SHEET_URL = "PASTE_YOUR_COPIED_GOOGLE_SHEET_LINK_HERE"
+SHEET_URL = "https://drive.google.com/drive/my-drive?q=type:spreadsheet%20parent:0APQToMXbb47uUk9PVA"
 
 if "staff_df" not in st.session_state:
     try:
