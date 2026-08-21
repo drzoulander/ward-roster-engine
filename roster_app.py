@@ -600,9 +600,6 @@ if "staff_df" not in st.session_state:
 raw_df = st.session_state.staff_df.copy()
 
 missing_columns = {
-    "Night_Pool": False,
-    "Allow_Fragmented_Shifts": False,
-    "Entire_Roster_Leave": False,
     "Secondary_Role": "None",
     "Secondary_EFT": 0.0,
     "No_AM_DOW": "",
@@ -618,9 +615,19 @@ for col, default_val in missing_columns.items():
     if col not in raw_df.columns:
         raw_df[col] = default_val
 
+# Brute-force boolean parser to handle Google Sheets mixed types
+def make_boolean(val):
+    if pd.isna(val): 
+        return False
+    if isinstance(val, bool): 
+        return val
+    return str(val).strip().lower() in ['true', '1', 't', 'yes', 'y']
+
 bool_cols = ["Night_Pool", "Allow_Fragmented_Shifts", "Entire_Roster_Leave"]
 for col in bool_cols:
-    raw_df[col] = raw_df[col].astype(str).str.strip().str.lower().isin(['true', '1', 't', 'yes', 'y'])
+    if col not in raw_df.columns:
+        raw_df[col] = False
+    raw_df[col] = raw_df[col].apply(make_boolean)
 
 raw_df["EFT"] = pd.to_numeric(raw_df["EFT"], errors='coerce').fillna(1.0)
 raw_df["Secondary_EFT"] = pd.to_numeric(raw_df["Secondary_EFT"], errors='coerce').fillna(0.0)
