@@ -117,7 +117,7 @@ def solve_roster(df, num_days, start_date):
     vic_holidays = holidays.AU(subdiv='VIC', years=[start_date.year, end_date.year])
 
 staffing_level_penalties = []
-    
+
     for d in all_days:
         current_date = start_date + datetime.timedelta(days=d)
         is_weekend = current_date.weekday() >= 5
