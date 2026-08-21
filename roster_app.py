@@ -46,7 +46,7 @@ def load_initial_staff():
     return pd.DataFrame(staff_data)
 
 # ----------------------------------------
-# 2. THE SOLVER ENGINE (PHASE 2 & 3)
+# 2. THE SOLVER ENGINE 
 # ----------------------------------------
 def solve_roster(df, num_days, start_date, debug_flags):
     df = df.reset_index(drop=True)
@@ -65,7 +65,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
     
     for n in all_staff:
         has_secondary = df.iloc[n]["Secondary_Role"] != "None" and df.iloc[n]["Secondary_EFT"] > 0
-        
         for d in all_days:
             for s in range(3):
                 roster[(n, d, s)] = model.NewBoolVar(f'staff_{n}_day_{d}_shift_{s}')
@@ -77,14 +76,12 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 else:
                     model.Add(roster[(n, d, s)] == role_primary[(n, d, s)])
                     
-    # CONSTRAINT: Maximum 1 shift per day
     for n in all_staff:
         for d in all_days:
             model.AddAtMostOne(roster[(n, d, s)] for s in range(3))
             
     females = df.index[df['Gender'] == 'Female'].tolist()
 
-    # CONSTRAINT: Vacancy Tolerances & Calendar Logic
     end_date = start_date + datetime.timedelta(days=num_days)
     vic_holidays = holidays.AU(subdiv='VIC', years=[start_date.year, end_date.year])
     
@@ -117,7 +114,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(missing_weekend_night == 4 - night_sum)
                 staffing_level_penalties.append(missing_weekend_night * 10)
             
-    # CONSTRAINT: Skill Mix & Demographics
     leadership_penalties = []
     
     for d in all_days:
@@ -143,7 +139,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             model.Add(missing_anum == 1 - anum_sum)
             leadership_penalties.append(missing_anum * 15)
             
-    # CONSTRAINT: Night Pool vs Day Pool Separation
     if not debug_flags.get("ignore_night_pool"):
         for n in all_staff:
             is_night_pool = df.iloc[n]["Night_Pool"]
@@ -154,7 +149,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 else:
                     model.Add(roster[(n, d, 2)] == 0)
 
-    # CONSTRAINT: Leave and Availability
     for n in all_staff:
         leave_str = str(df.iloc[n]["Approved_Leave_Days"])
         
@@ -168,7 +162,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 
         study_str = str(df.iloc[n].get("Study_Leave_Days", ""))
         study_days = set(parse_days(study_str))
-        
         ext_str = str(df.iloc[n].get("External_Working_Days", ""))
         ext_days = set(parse_days(ext_str))
         
@@ -197,16 +190,14 @@ def solve_roster(df, num_days, start_date, debug_flags):
             for d in all_days:
                 current_date = start_date + datetime.timedelta(days=d)
                 day_name = current_date.strftime("%A").lower()
-                
                 if no_am_str and no_am_str != "nan" and day_name in no_am_str:
                     if (n, d, 0) in roster:
                         model.Add(roster[(n, d, 0)] == 0)
-                        
                 if no_pm_str and no_pm_str != "nan" and day_name in no_pm_str:
                     if (n, d, 1) in roster:
                         model.Add(roster[(n, d, 1)] == 0)
 
-    # CONSTRAINT: Hour-Aware EFT Allocation
+    # --- PROPORTIONAL EFT MATH UPGRADE ---
     for n in all_staff:
         is_fully_absent = df.iloc[n].get("Entire_Roster_Leave", False)
         has_secondary = df.iloc[n]["Secondary_Role"] != "None" and df.iloc[n]["Secondary_EFT"] > 0
@@ -222,46 +213,31 @@ def solve_roster(df, num_days, start_date, debug_flags):
             secondary_eft = df.iloc[n]["Secondary_EFT"] if has_secondary else 0.0
             total_eft = primary_eft + secondary_eft
             is_night_pool = df.iloc[n]["Night_Pool"]
-            
-            target_hours = total_eft * 80.0 * (num_days / 14.0)
             shift_length = 10.0 if is_night_pool else 8.0
             
-            leave_str = str(df.iloc[n]["Approved_Leave_Days"])
-            valid_leave_days = 0
-            if leave_str and leave_str.lower() != 'nan':
-                for val in leave_str.split(","):
-                    try:
-                        d = int(val.strip()) - 1
-                        if 0 <= d < num_days:
-                            valid_leave_days += 1
-                    except ValueError:
-                        pass
-                        
-            leave_hours_deduction = valid_leave_days * shift_length
+            # 1. Calculate Base Owed Shifts for a full 14 days
+            base_shifts = (total_eft * 80.0 * (num_days / 14.0)) / shift_length
             
-            study_str = str(df.iloc[n].get("Study_Leave_Days", ""))
-            study_count = 0
-            if study_str and study_str.lower() != 'nan':
-                for val in study_str.split(","):
-                    try:
-                        if 0 <= (int(val.strip()) - 1) < num_days: study_count += 1
-                    except ValueError: pass
-                    
-            study_hours_deduction = study_count * 8.0
+            # 2. Count actual calendar days of approved leave
+            valid_leave_days = len([d for d in parse_days(str(df.iloc[n]["Approved_Leave_Days"])) if 0 <= d < num_days])
+            study_count = len([d for d in parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))) if 0 <= d < num_days])
             
-            adjusted_target_hours = max(0, target_hours - leave_hours_deduction - study_hours_deduction)
-            final_shift_target = math.ceil(adjusted_target_hours / shift_length)
+            # 3. Calculate fraction of fortnight present
+            fraction_present = max(0.0, (num_days - valid_leave_days - study_count) / num_days)
+            
+            # 4. Scale target shifts proportionally and round to nearest whole shift
+            final_shift_target = round(base_shifts * fraction_present)
             
             if has_secondary:
-                sec_target_hours = secondary_eft * 80.0 * (num_days / 14.0)
-                sec_shift_target = math.ceil(sec_target_hours / shift_length)
+                sec_base = (secondary_eft * 80.0 * (num_days / 14.0)) / shift_length
+                sec_shift_target = round(sec_base * fraction_present)
                 sec_shift_target = min(sec_shift_target, final_shift_target)
                 model.Add(sum(role_secondary[(n, d, s)] for d in range(num_days) for s in range(3) if (n, d, s) in role_secondary) == sec_shift_target)
             
         if not debug_flags.get("ignore_eft"):
             model.Add(sum(roster[(n, d, s)] for d in range(num_days) for s in range(3) if (n, d, s) in roster) == final_shift_target)
 
-    # CONSTRAINT: Rest and Fatigue Rules (ALL SOFTENED)
+    # --- HARDENED FATIGUE & REST RULES ---
     fatigue_penalties = []
     
     if not debug_flags.get("ignore_fatigue"):
@@ -271,15 +247,11 @@ def solve_roster(df, num_days, start_date, debug_flags):
             last_shift = str(df.iloc[n]["Last_Shift_Type"]).strip()
             is_night_pool = df.iloc[n]["Night_Pool"]
             
-            study_str = str(df.iloc[n].get("Study_Leave_Days", ""))
-            study_days = [int(x.strip()) - 1 for x in study_str.split(",") if x.strip().isdigit()] if study_str and study_str.lower() != 'nan' else []
-            
-            ext_str = str(df.iloc[n].get("External_Working_Days", ""))
-            ext_days = [int(x.strip()) - 1 for x in ext_str.split(",") if x.strip().isdigit()] if ext_str and ext_str.lower() != 'nan' else []
-            
+            study_days = parse_days(str(df.iloc[n].get("Study_Leave_Days", "")))
+            ext_days = parse_days(str(df.iloc[n].get("External_Working_Days", "")))
             virtual_days = set(study_days + ext_days)
             
-            # 1. Minimum 8-Hour Gap (Only remaining hard physical law)
+            # 1. Minimum 8-Hour Gap (Hard)
             for d in range(num_days - 1):
                 model.AddImplication(roster[(n, d, 2)], roster[(n, d+1, 0)].Not())
                 model.AddImplication(roster[(n, d, 2)], roster[(n, d+1, 1)].Not())
@@ -290,7 +262,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(roster[(n, 0, 0)] == 0)
                 model.Add(roster[(n, 0, 1)] == 0)
                 
-            # 2. Dynamic Maximum Consecutive Shifts (Soft)
+            # 2. Dynamic Maximum Consecutive Shifts (HARD LAW AGAIN)
             shift_length = 10.0 if is_night_pool else 8.0
             shifts_per_fortnight = math.ceil((df.iloc[n]["EFT"] * 80.0) / shift_length)
             max_consec = int((shifts_per_fortnight / 2) + 1)
@@ -298,91 +270,65 @@ def solve_roster(df, num_days, start_date, debug_flags):
             for d in range(num_days - max_consec):
                 ward_shifts = sum(roster[(n, d+w, s)] for w in range(max_consec + 1) for s in range(3) if (n, d+w, s) in roster)
                 virtual_shifts = sum(1 for w in range(max_consec + 1) if (d+w) in virtual_days)
+                model.Add(ward_shifts + virtual_shifts <= max_consec)
                 
-                over_limit = model.NewIntVar(0, 14, f'over_consec_{n}_{d}')
-                model.Add(ward_shifts + virtual_shifts - max_consec <= over_limit)
-                fatigue_penalties.append(over_limit * 50)
-                
-            # Max 4 Night Shifts in a row (Softened to prevent crash)
             for d in range(num_days - 4):
-                over_nights = model.NewIntVar(0, 5, f'over_nights_{n}_{d}')
-                model.Add(sum(roster[(n, d+w, 2)] for w in range(5)) - 4 <= over_nights)
-                fatigue_penalties.append(over_nights * 100)
+                model.Add(sum(roster[(n, d+w, 2)] for w in range(5)) <= 4)
                 
-            # Boundary Consecutive Shifts (Soft)
             if prior_days > 0:
                 days_to_check = (max_consec + 1) - prior_days
                 remaining_allowed = max(0, max_consec - prior_days)
                 if days_to_check > 0 and num_days >= days_to_check:
                     ward_boundary = sum(roster[(n, w, s)] for w in range(days_to_check) for s in range(3) if (n, w, s) in roster)
                     virtual_boundary = sum(1 for w in range(days_to_check) if w in virtual_days)
-                    
-                    over_boundary = model.NewIntVar(0, 14, f'over_bound_{n}')
-                    model.Add(ward_boundary + virtual_boundary - remaining_allowed <= over_boundary)
-                    fatigue_penalties.append(over_boundary * 50)
+                    model.Add(ward_boundary + virtual_boundary <= remaining_allowed)
 
-            # 4. The 48-Hour Transition Rule
+            # 3. 48-Hour Transition Rule
             if last_shift == "Night" and not is_night_pool:
                 if num_days > 0:
-                    for s in range(3):
-                        model.Add(roster[(n, 0, s)] == 0)
+                    for s in range(3): model.Add(roster[(n, 0, s)] == 0)
                 if num_days > 1:
-                    for s in range(3):
-                        model.Add(roster[(n, 1, s)] == 0)
+                    for s in range(3): model.Add(roster[(n, 1, s)] == 0)
                         
-            # 5. Maximum Blocks of Shifts (Softened completely)
+            # 4. Boundary Block Transitions (Target ideally 2 blocks)
             allow_fragmented = df.iloc[n]["Allow_Fragmented_Shifts"]
             
             if not allow_fragmented:
-                block_starts = []
+                internal_starts = []
+                # We only count starts from Day 1 onwards. (Day 0 touches the boundary)
                 for d in range(1, num_days):
                     w_yest = sum(roster[(n, d-1, s)] for s in range(3) if (n, d-1, s) in roster) + (1 if d-1 in virtual_days else 0)
                     w_tod = sum(roster[(n, d, s)] for s in range(3) if (n, d, s) in roster) + (1 if d in virtual_days else 0)
-                    
-                    is_start = model.NewBoolVar(f'block_start_staff_{n}_day_{d}')
+                    is_start = model.NewBoolVar(f'internal_start_{n}_day_{d}')
                     model.Add(w_tod - w_yest <= is_start)
-                    block_starts.append(is_start)
-                    
-                w0 = sum(roster[(n, 0, s)] for s in range(3) if (n, 0, s) in roster) + (1 if 0 in virtual_days else 0)
-                is_start_0 = model.NewBoolVar(f'block_start_staff_{n}_day_0')
-                if prior_days == 0:
-                    model.Add(w0 <= is_start_0)
-                else:
-                    model.Add(0 <= is_start_0)
-                block_starts.append(is_start_0)
+                    internal_starts.append(is_start)
                 
-                # Soft block constraints
-                blocks_over_ideal = model.NewIntVar(0, 14, f'blocks_over_{n}')
-                model.Add(sum(block_starts) - 2 <= blocks_over_ideal)
-                fatigue_penalties.append(blocks_over_ideal * 30)
+                # Hard cap: Max 3 internal transitions
+                model.Add(sum(internal_starts) <= 3)
+                
+                # Soft penalty: Heavily penalize having more than 1 internal transition 
+                # (1 transition = 2 beautiful, consolidated blocks)
+                extra_blocks = model.NewIntVar(0, 14, f'extra_blocks_{n}')
+                model.Add(sum(internal_starts) - 1 <= extra_blocks)
+                fatigue_penalties.append(extra_blocks * 50)
                     
-            # 6. Minimum 2 Days Off / Min 2 Days On (Softened to prevent crash)
+            # 5. Min 2 Days Off / Min 2 Days On (HARD LAW AGAIN)
             if not allow_fragmented:
                 for d in range(num_days - 2):
                     w0 = sum(roster[(n, d, s)] for s in range(3) if (n, d, s) in roster) + (1 if d in virtual_days else 0)
                     w1 = sum(roster[(n, d+1, s)] for s in range(3) if (n, d+1, s) in roster) + (1 if d+1 in virtual_days else 0)
                     w2 = sum(roster[(n, d+2, s)] for s in range(3) if (n, d+2, s) in roster) + (1 if d+2 in virtual_days else 0)
                     
-                    frag_dev1 = model.NewIntVar(0, 3, f'frag1_{n}_{d}')
-                    model.Add(w0 - w1 + w2 - 1 <= frag_dev1)
-                    fatigue_penalties.append(frag_dev1 * 40)
-                    
-                    frag_dev2 = model.NewIntVar(0, 3, f'frag2_{n}_{d}')
-                    model.Add(w1 - w0 - w2 <= frag_dev2)
-                    fatigue_penalties.append(frag_dev2 * 40)
+                    model.Add(w0 - w1 + w2 <= 1)
+                    model.Add(w1 - w0 - w2 <= 0)
                     
                 w0 = sum(roster[(n, 0, s)] for s in range(3) if (n, 0, s) in roster) + (1 if 0 in virtual_days else 0)
                 w1 = sum(roster[(n, 1, s)] for s in range(3) if (n, 1, s) in roster) + (1 if 1 in virtual_days else 0)
                 
                 if prior_days == 0 and num_days > 1:
-                    frag_bound1 = model.NewIntVar(0, 3, f'frag_b1_{n}')
-                    model.Add(w0 - w1 <= frag_bound1)
-                    fatigue_penalties.append(frag_bound1 * 40)
-                    
+                    model.Add(w0 - w1 <= 0)
                 if prior_days > 0 and num_days > 1:
-                    frag_bound2 = model.NewIntVar(0, 3, f'frag_b2_{n}')
-                    model.Add(w1 - w0 <= frag_bound2)
-                    fatigue_penalties.append(frag_bound2 * 40)
+                    model.Add(w1 <= w0)
 
     # OPTIMIZATION: Soft Constraints
     shift_mix_penalties = []
@@ -426,18 +372,15 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(dev >= pm_shifts - (3 * am_shifts))
                 model.Add(dev >= -(pm_shifts - (3 * am_shifts)))
                 shift_mix_penalties.append(dev * 2) 
-                
             elif pref.upper() == "AM":
                 model.Add(dev >= am_shifts - (3 * pm_shifts))
                 model.Add(dev >= -(am_shifts - (3 * pm_shifts)))
                 shift_mix_penalties.append(dev * 2)
-                
             else:
                 model.Add(dev >= am_shifts - pm_shifts)
                 model.Add(dev >= -(am_shifts - pm_shifts))
                 shift_mix_penalties.append(dev * 4) 
 
-        # Late-Early limit (Softened completely)
         late_earlies = []
         for d in range(num_days - 1):
             is_late_early = model.NewBoolVar(f'late_early_staff_{n}_day_{d}')
@@ -497,16 +440,13 @@ def solve_roster(df, num_days, start_date, debug_flags):
                         if (n, d, s) in role_secondary and solver.Value(role_secondary[(n, d, s)]) == 1:
                             active_role = df.iloc[n]["Secondary_Role"]
                             
-                        if active_role == "ANUM":
-                            anum_present = True
-                        elif active_role == "RN (In Charge)":
-                            rn_in_charges.append(n)
+                        if active_role == "ANUM": anum_present = True
+                        elif active_role == "RN (In Charge)": rn_in_charges.append(n)
                             
                 if not anum_present and len(rn_in_charges) > 0:
                     acting_leaders.add((rn_in_charges[0], d, s))
 
         roster_output = []
-        
         day_headers = []
         for d in all_days:
             current_date = start_date + datetime.timedelta(days=d)
@@ -520,15 +460,16 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 "Staff ID": df.iloc[n]["ID"],
                 "Role": df.iloc[n]["Role"]
             }
-            
             for d in all_days:
                 assigned_shift = "" 
                 
-                study_str = str(df.iloc[n].get("Study_Leave_Days", ""))
-                study_days = [int(x.strip()) - 1 for x in study_str.split(",") if x.strip().isdigit()] if study_str and study_str.lower() != 'nan' else []
+                study_days = []
+                try: study_days = [int(x.strip()) - 1 for x in str(df.iloc[n].get("Study_Leave_Days", "")).split(",") if x.strip().isdigit()]
+                except: pass
                 
-                ext_str = str(df.iloc[n].get("External_Working_Days", ""))
-                ext_days = [int(x.strip()) - 1 for x in ext_str.split(",") if x.strip().isdigit()] if ext_str and ext_str.lower() != 'nan' else []
+                ext_days = []
+                try: ext_days = [int(x.strip()) - 1 for x in str(df.iloc[n].get("External_Working_Days", "")).split(",") if x.strip().isdigit()]
+                except: pass
                 
                 if d in study_days:
                     assigned_shift = "Study Leave"
@@ -546,9 +487,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
                                 assigned_shift += " (Shift Leader)"
                 
                 staff_row[day_headers[d]] = assigned_shift
-                
             roster_output.append(staff_row)
-            
         return pd.DataFrame(roster_output)
     else:
         return None
@@ -568,7 +507,6 @@ with st.sidebar:
     
     st.markdown("---")
     st.header("🛠️ Constraint Troubleshooter")
-    st.warning("If your roster is failing, turn these rules off ONE by ONE. The rule that fixes the roster is your bottleneck.")
     debug_flags = {
         "ignore_coverage": st.checkbox("Ignore Minimum Staff Levels (Allows short-staffed shifts)"),
         "ignore_leadership": st.checkbox("Ignore Leadership Minimums (Allows shifts with 0 leaders)"),
@@ -586,57 +524,33 @@ if "staff_df" not in st.session_state:
     try:
         pulled_df = conn.read(spreadsheet=SHEET_URL, ttl=0) 
         pulled_df = pulled_df.dropna(how="all")
-        
-        if pulled_df.empty or "ID" not in pulled_df.columns:
-            st.session_state.staff_df = load_initial_staff()
-        else:
-            st.session_state.staff_df = pulled_df
-            
-    except Exception as e:
-        st.error(f"Google Sheets Connection Error: {e}")
+        st.session_state.staff_df = pulled_df
+    except:
         st.session_state.staff_df = load_initial_staff()
 
 # --- FORCE CLEAN DATA TYPES ---
 raw_df = st.session_state.staff_df.copy()
-
-# 1. Brutally strip any invisible spaces from Google Sheet column names
 raw_df.columns = raw_df.columns.str.strip()
 
 missing_columns = {
-    "Secondary_Role": "None",
-    "Secondary_EFT": 0.0,
-    "No_AM_DOW": "",
-    "No_PM_DOW": "",
-    "Preferred_Shift": "None",
-    "Study_Leave_Days": "",
-    "External_Working_Days": "",
-    "W1_Preferences": "",
-    "W2_Preferences": ""
+    "Secondary_Role": "None", "Secondary_EFT": 0.0, "No_AM_DOW": "", "No_PM_DOW": "",
+    "Preferred_Shift": "None", "Study_Leave_Days": "", "External_Working_Days": "",
+    "W1_Preferences": "", "W2_Preferences": ""
 }
 
 for col, default_val in missing_columns.items():
-    if col not in raw_df.columns:
-        raw_df[col] = default_val
+    if col not in raw_df.columns: raw_df[col] = default_val
 
-# 2. The Bulletproof Boolean Parser
 def make_boolean(val):
-    if pd.isna(val): 
-        return False
-    if isinstance(val, bool): 
-        return val
-    
-    # Convert absolutely anything Google sends into a loud, uppercase string
+    if pd.isna(val): return False
+    if isinstance(val, bool): return val
     val_str = str(val).strip().upper()
-    if val_str in ['TRUE', '1', '1.0', 'T', 'YES', 'Y']:
-        return True
+    if val_str in ['TRUE', '1', '1.0', 'T', 'YES', 'Y']: return True
     return False
 
 bool_cols = ["Night_Pool", "Allow_Fragmented_Shifts", "Entire_Roster_Leave"]
 for col in bool_cols:
-    if col not in raw_df.columns:
-        raw_df[col] = False
-        
-    # Apply the parser AND force the entire column to be a strict Python boolean type
+    if col not in raw_df.columns: raw_df[col] = False
     raw_df[col] = raw_df[col].apply(make_boolean).astype(bool)
 
 raw_df["EFT"] = pd.to_numeric(raw_df["EFT"], errors='coerce').fillna(1.0)
@@ -648,12 +562,6 @@ for col in raw_df.columns:
         raw_df[col] = raw_df[col].astype(str).str.replace(r'\.0$', '', regex=True).replace('nan', '')
 
 st.session_state.staff_df = raw_df
-
-with st.expander("🔍 DEBUG: What is the app actually reading from Google?"):
-    st.write("1. Exact Column Headers found in Google Sheets:")
-    st.write(list(st.session_state.staff_df.columns))
-    st.write("2. Raw Night Pool Data (First 10 rows):")
-    st.dataframe(st.session_state.staff_df[["ID", "Night_Pool"]].head(10))
 
 st.subheader("Staff Pool Management")
 edited_df = st.data_editor(
@@ -667,18 +575,18 @@ edited_df = st.data_editor(
         "EFT": st.column_config.NumberColumn("EFT", min_value=0.1, max_value=1.0, step=0.1),
         "Prior_Consecutive_Days": st.column_config.NumberColumn("Prior Consec", min_value=0, max_value=6, step=1),
         "Last_Shift_Type": st.column_config.SelectboxColumn("Last Shift Type", options=["None", "AM", "PM", "Night"]),
-        "Unavailable_DOW": st.column_config.TextColumn("Unavailable Days (e.g., Monday, Tuesday)"),
+        "Unavailable_DOW": st.column_config.TextColumn("Unavailable Days"),
         "Allow_Fragmented_Shifts": st.column_config.CheckboxColumn("Allow Fragmented Shifts", default=False),
         "Entire_Roster_Leave": st.column_config.CheckboxColumn("On Leave (Entire Roster)", default=False),
         "Secondary_Role": st.column_config.SelectboxColumn("Secondary Role", options=["None", "ANUM", "RN (In Charge)", "RN", "EN/Learner"]),
         "Secondary_EFT": st.column_config.NumberColumn("Secondary EFT", min_value=0.0, max_value=1.0, step=0.1),
-        "No_AM_DOW": st.column_config.TextColumn("No AM Days (e.g. Monday)"),
-        "No_PM_DOW": st.column_config.TextColumn("No PM Days (e.g. Tuesday, Friday)"),
+        "No_AM_DOW": st.column_config.TextColumn("No AM Days"),
+        "No_PM_DOW": st.column_config.TextColumn("No PM Days"),
         "Preferred_Shift": st.column_config.SelectboxColumn("Preferred Shift", options=["None", "AM", "PM", "Night"]),
-        "Study_Leave_Days": st.column_config.TextColumn("Study Leave (e.g. 5, 12)"),
-        "External_Working_Days": st.column_config.TextColumn("External/CNM Days (e.g. 3, 4, 5)"),
-        "W1_Preferences": st.column_config.TextColumn("W1 Prefs (e.g. Mon AM, Tue PM)"),
-        "W2_Preferences": st.column_config.TextColumn("W2 Prefs (e.g. Wed Night)")
+        "Study_Leave_Days": st.column_config.TextColumn("Study Leave"),
+        "External_Working_Days": st.column_config.TextColumn("External/CNM Days"),
+        "W1_Preferences": st.column_config.TextColumn("W1 Prefs"),
+        "W2_Preferences": st.column_config.TextColumn("W2 Prefs")
     }
 )
 
@@ -697,24 +605,17 @@ with col1:
 
 with col2:
     if st.button("🔄 Sync from Google Sheet"):
-        if "staff_df" in st.session_state:
-            del st.session_state["staff_df"]
+        if "staff_df" in st.session_state: del st.session_state["staff_df"]
         st.rerun()
 
 if st.button("Generate Roster", type="primary"):
-    with st.spinner("Calculating optimal shifts (this may take a few seconds)..."):
+    with st.spinner("Calculating optimal shifts..."):
         result_df = solve_roster(edited_df, roster_days, start_date, debug_flags)
         
         if result_df is not None:
             st.success("Roster Generated Successfully!")
             st.dataframe(result_df, use_container_width=True)
-            
             csv = result_df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="Download Roster as CSV",
-                data=csv,
-                file_name='ward_roster.csv',
-                mime='text/csv',
-            )
+            st.download_button(label="Download Roster as CSV", data=csv, file_name='ward_roster.csv', mime='text/csv')
         else:
             st.error("No feasible roster could be generated. Try relaxing constraints in the Troubleshooter panel.")
