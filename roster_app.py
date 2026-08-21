@@ -116,6 +116,8 @@ def solve_roster(df, num_days, start_date):
     end_date = start_date + datetime.timedelta(days=num_days)
     vic_holidays = holidays.AU(subdiv='VIC', years=[start_date.year, end_date.year])
 
+staffing_level_penalties = []
+    
     for d in all_days:
         current_date = start_date + datetime.timedelta(days=d)
         is_weekend = current_date.weekday() >= 5
@@ -135,11 +137,17 @@ def solve_roster(df, num_days, start_date):
             
         # 3. NIGHT SHIFT (s=2)
         night_sum = sum(roster[(n, d, 2)] for n in all_staff)
+        
+        # Hard Rule: ALL night shifts (weekday or weekend) must have between 3 and 4 staff
+        model.Add(night_sum >= 3)
+        model.Add(night_sum <= 4)
+        
+        # Soft Rule: Weekends and Public Holidays should ideally have 4
         if is_weekend or is_pub_hol:
-            model.Add(night_sum == 4)
-        else:
-            model.Add(night_sum >= 3)
-            model.Add(night_sum <= 4)
+            missing_weekend_night = model.NewIntVar(0, 1, f'missing_wknd_night_d{d}')
+            model.Add(missing_weekend_night == 4 - night_sum)
+            # We apply a penalty of 10 to heavily encourage the engine to find a 4th person if possible
+            staffing_level_penalties.append(missing_weekend_night * 10)
             
     # CONSTRAINT: Skill Mix & Demographics
     leadership_penalties = []
@@ -499,7 +507,7 @@ def solve_roster(df, num_days, start_date):
                         penalties.append(roster[(n, d, s)] * 2)
 
     # Feed ALL penalties and rewards into the final optimization
-    model.Minimize(sum(shift_mix_penalties) + sum(penalties) + sum(granular_penalties) + sum(leadership_penalties))              
+    model.Minimize(sum(shift_mix_penalties) + sum(penalties) + sum(granular_penalties) + sum(leadership_penalties) + sum(staffing_level_penalties))            
     
     # EXECUTE THE SOLVER
     solver = cp_model.CpSolver()
