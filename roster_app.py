@@ -595,22 +595,22 @@ with st.sidebar:
 
 # --- GOOGLE SHEETS CONNECTION ---
 conn = st.connection("gsheets", type=GSheetsConnection)
-SHEET_URL = "https://docs.google.com/spreadsheets/d/12MZmbtrC6q2llsY-V-mAzzgJ4asizPe3TV0U6_DsmGY/edit?gid=0#gid=0"
+SHEET_URL = "PASTE_YOUR_COPIED_GOOGLE_SHEET_LINK_HERE"
 
 if "staff_df" not in st.session_state:
     try:
-        # Pull data directly from the cloud
-        pulled_df = conn.read(spreadsheet=SHEET_URL)
-        # Google Sheets sometimes adds invisible empty rows at the bottom; this cleans them
+        # ttl=0 forces Streamlit to bypass the cache and fetch fresh data!
+        pulled_df = conn.read(spreadsheet=SHEET_URL, ttl=0) 
         pulled_df = pulled_df.dropna(how="all")
         
-        # If it is a brand new blank sheet, load the default template instead
         if pulled_df.empty or "ID" not in pulled_df.columns:
             st.session_state.staff_df = load_initial_staff()
         else:
             st.session_state.staff_df = pulled_df
-    except Exception:
-        # Fallback just in case the internet blinks
+            
+    except Exception as e:
+        # If the connection fails, print the exact error on the screen!
+        st.error(f"Google Sheets Connection Error: {e}")
         st.session_state.staff_df = load_initial_staff()
 
 # --- FORCE CLEAN DATA TYPES (Bypasses Memory Caching Bugs) ---
