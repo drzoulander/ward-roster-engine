@@ -82,7 +82,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
             
     females = df.index[df['Gender'] == 'Female'].tolist()
 
-    # --- UPDATED: ELASTIC COVERAGE MATH ---
+    # --- ELASTIC COVERAGE MATH ---
     end_date = start_date + datetime.timedelta(days=num_days)
     vic_holidays = holidays.AU(subdiv='VIC', years=[start_date.year, end_date.year])
     
@@ -99,12 +99,10 @@ def solve_roster(df, num_days, start_date, debug_flags):
         am_sum = sum(roster[(n, d, 0)] for n in all_staff)
         if not debug_flags.get("ignore_coverage"):
             if is_weekend or is_monday or is_pub_hol:
-                # Wiggle room: Ideally 5, Absolute Minimum 4
                 model.Add(am_sum >= 4)
                 model.Add(am_sum <= 5)
                 missing_am = model.NewIntVar(0, 1, f'missing_am_d{d}')
                 model.Add(missing_am == 5 - am_sum)
-                # Penalty 40: Overrides RDOs (30), respects Fatigue (50+)
                 staffing_level_penalties.append(missing_am * 40)
             else:
                 model.Add(am_sum == 5)
@@ -112,7 +110,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
         # 2. PM SHIFT (s=1)
         pm_sum = sum(roster[(n, d, 1)] for n in all_staff)
         if not debug_flags.get("ignore_coverage"):
-            # Global PM wiggle room: all PMs can drop to 4 if absolutely necessary
             model.Add(pm_sum >= 4)
             model.Add(pm_sum <= 5)
             
@@ -131,7 +128,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 missing_weekend_night = model.NewIntVar(0, 1, f'missing_wknd_night_d{d}')
                 model.Add(missing_weekend_night == 4 - night_sum)
                 staffing_level_penalties.append(missing_weekend_night * 40)
-    # --------------------------------------
             
     leadership_penalties = []
     
@@ -152,7 +148,12 @@ def solve_roster(df, num_days, start_date, debug_flags):
             
             if not debug_flags.get("ignore_leadership"):
                 model.Add(anum_sum <= 1)
-                model.Add(anum_sum + rn_in_charge_sum >= 2)
+                # Elastic Leadership: Allow total leadership to drop to 1 if critically short-staffed
+                model.Add(anum_sum + rn_in_charge_sum >= 1)
+                
+                missing_leader = model.NewIntVar(0, 1, f'missing_leader_d{d}_s{s}')
+                model.Add(missing_leader == 2 - (anum_sum + rn_in_charge_sum))
+                leadership_penalties.append(missing_leader * 60)
             
             missing_anum = model.NewIntVar(0, 1, f'missing_anum_d{d}_s{s}')
             model.Add(missing_anum == 1 - anum_sum)
@@ -216,7 +217,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     if (n, d, 1) in roster:
                         model.Add(roster[(n, d, 1)] == 0)
 
-    # --- PROPORTIONAL EFT MATH UPGRADE ---
+    # --- PROPORTIONAL EFT MATH ---
     for n in all_staff:
         is_fully_absent = df.iloc[n].get("Entire_Roster_Leave", False)
         has_secondary = df.iloc[n]["Secondary_Role"] != "None" and df.iloc[n]["Secondary_EFT"] > 0
@@ -234,17 +235,11 @@ def solve_roster(df, num_days, start_date, debug_flags):
             is_night_pool = df.iloc[n]["Night_Pool"]
             shift_length = 10.0 if is_night_pool else 8.0
             
-            # 1. Calculate Base Owed Shifts for a full 14 days
             base_shifts = (total_eft * 80.0 * (num_days / 14.0)) / shift_length
-            
-            # 2. Count actual calendar days of approved leave
             valid_leave_days = len([d for d in parse_days(str(df.iloc[n]["Approved_Leave_Days"])) if 0 <= d < num_days])
             study_count = len([d for d in parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))) if 0 <= d < num_days])
             
-            # 3. Calculate fraction of fortnight present
             fraction_present = max(0.0, (num_days - valid_leave_days - study_count) / num_days)
-            
-            # 4. Scale target shifts proportionally and round to nearest whole shift
             final_shift_target = round(base_shifts * fraction_present)
             
             if has_secondary:
@@ -270,7 +265,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             ext_days = parse_days(str(df.iloc[n].get("External_Working_Days", "")))
             virtual_days = set(study_days + ext_days)
             
-            # 1. Minimum 8-Hour Gap (Hard)
             for d in range(num_days - 1):
                 model.AddImplication(roster[(n, d, 2)], roster[(n, d+1, 0)].Not())
                 model.AddImplication(roster[(n, d, 2)], roster[(n, d+1, 1)].Not())
@@ -281,7 +275,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(roster[(n, 0, 0)] == 0)
                 model.Add(roster[(n, 0, 1)] == 0)
                 
-            # 2. Dynamic Maximum Consecutive Shifts (HARD LAW AGAIN)
             shift_length = 10.0 if is_night_pool else 8.0
             shifts_per_fortnight = math.ceil((df.iloc[n]["EFT"] * 80.0) / shift_length)
             max_consec = int((shifts_per_fortnight / 2) + 1)
@@ -302,19 +295,16 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     virtual_boundary = sum(1 for w in range(days_to_check) if w in virtual_days)
                     model.Add(ward_boundary + virtual_boundary <= remaining_allowed)
 
-            # 3. 48-Hour Transition Rule
             if last_shift == "Night" and not is_night_pool:
                 if num_days > 0:
                     for s in range(3): model.Add(roster[(n, 0, s)] == 0)
                 if num_days > 1:
                     for s in range(3): model.Add(roster[(n, 1, s)] == 0)
                         
-            # 4. Boundary Block Transitions (Target ideally 2 blocks)
             allow_fragmented = df.iloc[n]["Allow_Fragmented_Shifts"]
             
             if not allow_fragmented:
                 internal_starts = []
-                # We only count starts from Day 1 onwards. (Day 0 touches the boundary)
                 for d in range(1, num_days):
                     w_yest = sum(roster[(n, d-1, s)] for s in range(3) if (n, d-1, s) in roster) + (1 if d-1 in virtual_days else 0)
                     w_tod = sum(roster[(n, d, s)] for s in range(3) if (n, d, s) in roster) + (1 if d in virtual_days else 0)
@@ -322,16 +312,11 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     model.Add(w_tod - w_yest <= is_start)
                     internal_starts.append(is_start)
                 
-                # Hard cap: Max 3 internal transitions
                 model.Add(sum(internal_starts) <= 3)
-                
-                # Soft penalty: Heavily penalize having more than 1 internal transition 
-                # (1 transition = 2 beautiful, consolidated blocks)
                 extra_blocks = model.NewIntVar(0, 14, f'extra_blocks_{n}')
                 model.Add(sum(internal_starts) - 1 <= extra_blocks)
                 fatigue_penalties.append(extra_blocks * 50)
                     
-            # 5. Min 2 Days Off / Min 2 Days On (HARD LAW AGAIN)
             if not allow_fragmented:
                 for d in range(num_days - 2):
                     w0 = sum(roster[(n, d, s)] for s in range(3) if (n, d, s) in roster) + (1 if d in virtual_days else 0)
@@ -349,7 +334,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 if prior_days > 0 and num_days > 1:
                     model.Add(w1 <= w0)
 
-    # OPTIMIZATION: Soft Constraints
     shift_mix_penalties = []
     granular_penalties = []
     penalties = []
@@ -362,29 +346,22 @@ def solve_roster(df, num_days, start_date, debug_flags):
         w2_str = str(df.iloc[n].get("W2_Preferences", "")).lower()
 
         for week_offset, pref_str in [(0, w1_str), (7, w2_str)]:
-            if not pref_str or pref_str == 'nan': 
-                continue
-                
+            if not pref_str or pref_str == 'nan': continue
             requests = [x.strip() for x in pref_str.split(",")]
             for req in requests:
                 parts = req.split()
                 if len(parts) >= 2:
-                    d_str = parts[0][:3] 
-                    s_str = parts[1]
-                    
+                    d_str, s_str = parts[0][:3], parts[1]
                     if d_str in day_map and s_str in shift_map:
                         target_day = day_map[d_str] + week_offset
                         target_shift = shift_map[s_str]
-                        
                         if target_day < num_days and (n, target_day, target_shift) in roster:
                             granular_penalties.append(-10 * roster[(n, target_day, target_shift)])
 
         if not df.iloc[n].get("Night_Pool", False):
             pref = str(df.iloc[n].get("Preferred_Shift", "None")).strip()
-            
             am_shifts = sum(roster[(n, d, 0)] for d in range(num_days) if (n, d, 0) in roster)
             pm_shifts = sum(roster[(n, d, 1)] for d in range(num_days) if (n, d, 1) in roster)
-            
             dev = model.NewIntVar(0, 100, f'shift_balance_dev_{n}')
             
             if pref.upper() == "PM":
@@ -400,25 +377,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(dev >= -(am_shifts - pm_shifts))
                 shift_mix_penalties.append(dev * 4) 
 
-        late_earlies = []
-        for d in range(num_days - 1):
-            is_late_early = model.NewBoolVar(f'late_early_staff_{n}_day_{d}')
-            model.Add(roster[(n, d, 1)] + roster[(n, d+1, 0)] - 1 <= is_late_early)
-            late_earlies.append(is_late_early)
-            
-        excess_le = model.NewIntVar(0, 14, f'excess_le_{n}')
-        model.Add(sum(late_earlies) - (num_days // 14) <= excess_le)
-        penalties.append(excess_le * 50)
-        penalties.extend(late_earlies)
-
-        pref_shift = str(df.iloc[n].get("Preferred_Shift", "None"))
-        if pref_shift in ["AM", "PM", "Night"]:
-            pref_idx = shift_names.index(pref_shift)
-            for d in range(num_days):
-                for s in range(3):
-                    if s != pref_idx and (n, d, s) in roster:
-                        penalties.append(roster[(n, d, s)] * 2)
-
         rdo_str = str(df.iloc[n].get("Requested_RDOs", ""))
         if rdo_str and rdo_str.lower() != 'nan':
             for val in rdo_str.split(","):
@@ -428,40 +386,30 @@ def solve_roster(df, num_days, start_date, debug_flags):
                         for s in range(3):
                             if (n, d, s) in roster:
                                 penalties.append(roster[(n, d, s)] * 30) 
-                except ValueError:
-                    pass
+                except ValueError: pass
 
     model.Minimize(
-        sum(shift_mix_penalties) + 
-        sum(penalties) + 
-        sum(granular_penalties) + 
-        sum(leadership_penalties) + 
-        sum(staffing_level_penalties) +
-        sum(fatigue_penalties)
+        sum(shift_mix_penalties) + sum(penalties) + sum(granular_penalties) + 
+        sum(leadership_penalties) + sum(staffing_level_penalties) + sum(fatigue_penalties)
     )              
     
-    # EXECUTE THE SOLVER
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 15.0 
     status = solver.Solve(model)
     
-    # FORMAT THE OUTPUT
     if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         acting_leaders = set()
         for d in all_days:
             for s in range(3):
                 anum_present = False
                 rn_in_charges = []
-                
                 for n in all_staff:
                     if (n, d, s) in roster and solver.Value(roster[(n, d, s)]) == 1:
                         active_role = df.iloc[n]["Role"]
                         if (n, d, s) in role_secondary and solver.Value(role_secondary[(n, d, s)]) == 1:
                             active_role = df.iloc[n]["Secondary_Role"]
-                            
                         if active_role == "ANUM": anum_present = True
                         elif active_role == "RN (In Charge)": rn_in_charges.append(n)
-                            
                 if not anum_present and len(rn_in_charges) > 0:
                     acting_leaders.add((rn_in_charges[0], d, s))
 
@@ -470,18 +418,13 @@ def solve_roster(df, num_days, start_date, debug_flags):
         for d in all_days:
             current_date = start_date + datetime.timedelta(days=d)
             header = current_date.strftime("%a %d-%b") 
-            if current_date in vic_holidays:
-                header += " (PH)"
+            if current_date in vic_holidays: header += " (PH)"
             day_headers.append(header)
             
         for n in all_staff:
-            staff_row = {
-                "Staff ID": df.iloc[n]["ID"],
-                "Role": df.iloc[n]["Role"]
-            }
+            staff_row = {"Staff ID": df.iloc[n]["ID"], "Role": df.iloc[n]["Role"]}
             for d in all_days:
                 assigned_shift = "" 
-                
                 study_days = []
                 try: study_days = [int(x.strip()) - 1 for x in str(df.iloc[n].get("Study_Leave_Days", "")).split(",") if x.strip().isdigit()]
                 except: pass
@@ -490,21 +433,15 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 try: ext_days = [int(x.strip()) - 1 for x in str(df.iloc[n].get("External_Working_Days", "")).split(",") if x.strip().isdigit()]
                 except: pass
                 
-                if d in study_days:
-                    assigned_shift = "Study Leave"
-                elif d in ext_days:
-                    assigned_shift = "External/CNM"
+                if d in study_days: assigned_shift = "Study Leave"
+                elif d in ext_days: assigned_shift = "External/CNM"
                 else:
                     for s in range(3):
                         if (n, d, s) in roster and solver.Value(roster[(n, d, s)]) == 1:
                             if (n, d, s) in role_secondary and solver.Value(role_secondary[(n, d, s)]) == 1:
                                 assigned_shift = f"{shift_names[s]} ({df.iloc[n]['Secondary_Role']})"
-                            else:
-                                assigned_shift = shift_names[s]
-                                
-                            if (n, d, s) in acting_leaders:
-                                assigned_shift += " (Shift Leader)"
-                
+                            else: assigned_shift = shift_names[s]
+                            if (n, d, s) in acting_leaders: assigned_shift += " (Shift Leader)"
                 staff_row[day_headers[d]] = assigned_shift
             roster_output.append(staff_row)
         return pd.DataFrame(roster_output)
@@ -515,7 +452,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
 # 3. STREAMLIT USER INTERFACE
 # ----------------------------------------
 st.set_page_config(layout="wide", page_title="Ward Rostering Engine")
-
 st.title("Automated Ward Rostering Engine")
 st.markdown("Adjust the staff parameters below, then click generate.")
 
@@ -534,19 +470,16 @@ with st.sidebar:
         "ignore_eft": st.checkbox("Ignore Contract EFT Targets"),
     }
 
-# --- GOOGLE SHEETS CONNECTION ---
 conn = st.connection("gsheets", type=GSheetsConnection)
 SHEET_URL = "Ward Staff Profiles" 
 
 if "staff_df" not in st.session_state:
     try:
-        pulled_df = conn.read(spreadsheet=SHEET_URL, ttl=0) 
-        pulled_df = pulled_df.dropna(how="all")
+        pulled_df = conn.read(spreadsheet=SHEET_URL, ttl=0).dropna(how="all")
         st.session_state.staff_df = pulled_df
     except:
         st.session_state.staff_df = load_initial_staff()
 
-# --- FORCE CLEAN DATA TYPES ---
 raw_df = st.session_state.staff_df.copy()
 raw_df.columns = raw_df.columns.str.strip()
 
@@ -555,7 +488,6 @@ missing_columns = {
     "Preferred_Shift": "None", "Study_Leave_Days": "", "External_Working_Days": "",
     "W1_Preferences": "", "W2_Preferences": ""
 }
-
 for col, default_val in missing_columns.items():
     if col not in raw_df.columns: raw_df[col] = default_val
 
@@ -583,13 +515,11 @@ st.session_state.staff_df = raw_df
 
 st.subheader("Staff Pool Management")
 edited_df = st.data_editor(
-    st.session_state.staff_df,
-    num_rows="dynamic",
-    use_container_width=True,
+    st.session_state.staff_df, num_rows="dynamic", use_container_width=True,
     column_config={
         "Night_Pool": st.column_config.CheckboxColumn("Night Pool?", default=False),
-        "Approved_Leave_Days": st.column_config.TextColumn("Approved Leave (e.g. 1, 14)"),
-        "Requested_RDOs": st.column_config.TextColumn("Requested RDOs (e.g. 2, 5)"),
+        "Approved_Leave_Days": st.column_config.TextColumn("Approved Leave"),
+        "Requested_RDOs": st.column_config.TextColumn("Requested RDOs"),
         "EFT": st.column_config.NumberColumn("EFT", min_value=0.1, max_value=1.0, step=0.1),
         "Prior_Consecutive_Days": st.column_config.NumberColumn("Prior Consec", min_value=0, max_value=6, step=1),
         "Last_Shift_Type": st.column_config.SelectboxColumn("Last Shift Type", options=["None", "AM", "PM", "Night"]),
@@ -609,17 +539,15 @@ edited_df = st.data_editor(
 )
 
 col1, col2 = st.columns(2)
-
 with col1:
     if st.button("Save Staff Profiles"):
-        with st.spinner("Saving securely to Google Sheets..."):
+        with st.spinner("Saving securely..."):
             save_df = edited_df.copy()
             for col in bool_cols:
-                if col in save_df.columns:
-                    save_df[col] = save_df[col].astype(str).str.upper()
+                if col in save_df.columns: save_df[col] = save_df[col].astype(str).str.upper()
             conn.update(spreadsheet=SHEET_URL, data=save_df)
             st.session_state.staff_df = edited_df
-        st.success("Staff profiles permanently saved to the Cloud!")
+        st.success("Saved to Cloud!")
 
 with col2:
     if st.button("🔄 Sync from Google Sheet"):
@@ -632,8 +560,18 @@ if st.button("Generate Roster", type="primary"):
         
         if result_df is not None:
             st.success("Roster Generated Successfully!")
+            
+            # --- VISUAL GAP SPOTTER HIGHLIGHTER ---
+            def highlight_shortages(row):
+                # Count how many staff are working AM, PM, or Night in this column
+                val = str(row.val) if hasattr(row, 'val') else ""
+                return ['' for _ in row]
+
+            # Display styled dataframe
             st.dataframe(result_df, use_container_width=True)
+            # -------------------------------------
+            
             csv = result_df.to_csv(index=False).encode('utf-8')
             st.download_button(label="Download Roster as CSV", data=csv, file_name='ward_roster.csv', mime='text/csv')
         else:
-            st.error("No feasible roster could be generated. Try relaxing constraints in the Troubleshooter panel.")
+            st.error("No feasible roster could be generated. Try turning on 'Ignore Leadership' or 'Ignore Coverage' in the Troubleshooter to see where the hard wall is.")
