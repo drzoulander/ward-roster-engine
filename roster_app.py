@@ -595,7 +595,7 @@ with st.sidebar:
 
 # --- GOOGLE SHEETS CONNECTION ---
 conn = st.connection("gsheets", type=GSheetsConnection)
-SHEET_URL = "https://drive.google.com/drive/my-drive?q=type:spreadsheet%20parent:0APQToMXbb47uUk9PVA"
+SHEET_URL = "Ward Staff Profiles"
 
 if "staff_df" not in st.session_state:
     try:
