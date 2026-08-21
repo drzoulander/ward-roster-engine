@@ -187,8 +187,8 @@ def solve_roster(df, num_days, start_date):
         ext_str = str(df.iloc[n].get("External_Working_Days", ""))
         ext_days = set(parse_days(ext_str))
         
-        # Combine all leave, RDOs, study days, and external days into one blocked list
-        unavailable_days = set(parse_days(leave_str) + parse_days(rdo_str)) | study_days | ext_days
+        # HARD BLOCK: Only Approved Leave, Study Days, and External Days are strictly enforced
+        unavailable_days = set(parse_days(leave_str)) | study_days | ext_days
                 
         for d in unavailable_days:
             if 0 <= d < num_days:
@@ -459,6 +459,21 @@ def solve_roster(df, num_days, start_date):
                 for s in range(3):
                     if s != pref_idx and (n, d, s) in roster:
                         penalties.append(roster[(n, d, s)] * 2)
+
+    # 5. Requested RDOs (Avoid if possible, but allow if necessary)
+        rdo_str = str(df.iloc[n].get("Requested_RDOs", ""))
+        if rdo_str and rdo_str.lower() != 'nan':
+            for val in rdo_str.split(","):
+                try:
+                    d = int(val.strip()) - 1
+                    if 0 <= d < num_days:
+                        for s in range(3):
+                            if (n, d, s) in roster:
+                                # Apply a high penalty (30) to heavily discourage working this day,
+                                # but allow it if it prevents the entire roster from failing.
+                                penalties.append(roster[(n, d, s)] * 30) 
+                except ValueError:
+                    pass
 
     # Feed ALL penalties and rewards into the final optimization
     model.Minimize(sum(shift_mix_penalties) + sum(penalties) + sum(granular_penalties) + sum(leadership_penalties) + sum(staffing_level_penalties))              
