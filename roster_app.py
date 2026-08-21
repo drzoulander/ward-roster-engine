@@ -639,6 +639,12 @@ for col in raw_df.columns:
 
 st.session_state.staff_df = raw_df
 
+with st.expander("🔍 DEBUG: What is the app actually reading from Google?"):
+    st.write("1. Exact Column Headers found in Google Sheets:")
+    st.write(list(st.session_state.staff_df.columns))
+    st.write("2. Raw Night Pool Data (First 10 rows):")
+    st.dataframe(st.session_state.staff_df[["ID", "Night_Pool"]].head(10))
+
 st.subheader("Staff Pool Management")
 edited_df = st.data_editor(
     st.session_state.staff_df,
