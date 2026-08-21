@@ -114,11 +114,9 @@ def solve_roster(df, num_days, start_date, debug_flags):
         # 3. NIGHT SHIFT (s=2)
         night_sum = sum(roster[(n, d, 2)] for n in all_staff)
         if not debug_flags.get("ignore_coverage"):
-            # Hard Rule: ALL night shifts (weekday or weekend) must have between 3 and 4 staff
             model.Add(night_sum >= 3)
             model.Add(night_sum <= 4)
             
-            # Soft Rule: Weekends and Public Holidays should ideally have 4
             if is_weekend or is_pub_hol:
                 missing_weekend_night = model.NewIntVar(0, 1, f'missing_wknd_night_d{d}')
                 model.Add(missing_weekend_night == 4 - night_sum)
@@ -129,7 +127,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
     
     for d in all_days:
         for s in range(3):
-            # Gender mix
             if not debug_flags.get("ignore_leadership"):
                 model.Add(sum(roster[(n, d, s)] for n in females if (n, d, s) in roster) >= 1)
             
@@ -143,15 +140,10 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 sum(role_secondary[(n, d, s)] for n in all_staff if df.iloc[n]["Secondary_Role"] == "RN (In Charge)" and (n, d, s) in role_secondary)
             )
             
-            # --- Leadership Constraints ---
             if not debug_flags.get("ignore_leadership"):
-                # 1. Hard rule: Max 1 ANUM per shift
                 model.Add(anum_sum <= 1)
-                
-                # 2. Hard rule: Total leadership coverage must be at least 2 
                 model.Add(anum_sum + rn_in_charge_sum >= 2)
             
-            # 3. Soft rule: Ideally 1 ANUM per shift. Penalty if it drops to 0.
             missing_anum = model.NewIntVar(0, 1, f'missing_anum_d{d}_s{s}')
             model.Add(missing_anum == 1 - anum_sum)
             leadership_penalties.append(missing_anum * 15)
@@ -185,7 +177,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
         ext_str = str(df.iloc[n].get("External_Working_Days", ""))
         ext_days = set(parse_days(ext_str))
         
-        # HARD BLOCK: Only Approved Leave, Study Days, and External Days are strictly enforced
         unavailable_days = set(parse_days(leave_str)) | study_days | ext_days
                 
         if not debug_flags.get("ignore_leave"):
@@ -272,11 +263,12 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 sec_shift_target = min(sec_shift_target, final_shift_target)
                 model.Add(sum(role_secondary[(n, d, s)] for d in range(num_days) for s in range(3) if (n, d, s) in role_secondary) == sec_shift_target)
             
-        # Apply the EFT constraint unless debug mode ignores it
         if not debug_flags.get("ignore_eft"):
             model.Add(sum(roster[(n, d, s)] for d in range(num_days) for s in range(3) if (n, d, s) in roster) == final_shift_target)
 
     # CONSTRAINT: Rest and Fatigue Rules
+    fatigue_penalties = []
+    
     if not debug_flags.get("ignore_fatigue"):
         for n in all_staff:
             raw_prior = df.iloc[n]["Prior_Consecutive_Days"]
@@ -304,19 +296,24 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(roster[(n, 0, 0)] == 0)
                 model.Add(roster[(n, 0, 1)] == 0)
                 
-            # 2. Maximum Consecutive Shifts (6 days total, 4 nights total)
-            for d in range(num_days - 6):
-                ward_shifts = sum(roster[(n, d+w, s)] for w in range(7) for s in range(3) if (n, d+w, s) in roster)
-                virtual_shifts = sum(1 for w in range(7) if (d+w) in virtual_days)
-                model.Add(ward_shifts + virtual_shifts <= 6)
+            # --- UPDATED: Dynamic Maximum Consecutive Shifts ---
+            shift_length = 10.0 if is_night_pool else 8.0
+            shifts_per_fortnight = math.ceil((df.iloc[n]["EFT"] * 80.0) / shift_length)
+            max_consec = int((shifts_per_fortnight / 2) + 1)
+            
+            for d in range(num_days - max_consec):
+                ward_shifts = sum(roster[(n, d+w, s)] for w in range(max_consec + 1) for s in range(3) if (n, d+w, s) in roster)
+                virtual_shifts = sum(1 for w in range(max_consec + 1) if (d+w) in virtual_days)
+                model.Add(ward_shifts + virtual_shifts <= max_consec)
                 
+            # Max 4 Night Shifts in a row safety net
             for d in range(num_days - 4):
                 model.Add(sum(roster[(n, d+w, 2)] for w in range(5)) <= 4)
                 
-            # 2b. Boundary Consecutive Shifts
+            # Boundary Consecutive Shifts with dynamic math
             if prior_days > 0:
-                days_to_check = 7 - prior_days
-                remaining_allowed = max(0, 6 - prior_days)
+                days_to_check = (max_consec + 1) - prior_days
+                remaining_allowed = max(0, max_consec - prior_days)
                 if days_to_check > 0 and num_days >= days_to_check:
                     ward_boundary = sum(roster[(n, w, s)] for w in range(days_to_check) for s in range(3) if (n, w, s) in roster)
                     virtual_boundary = sum(1 for w in range(days_to_check) if w in virtual_days)
@@ -331,7 +328,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     for s in range(3):
                         model.Add(roster[(n, 1, s)] == 0)
                         
-            # 4. Maximum 2 Blocks of Shifts Per Fortnight
+            # --- UPDATED: Maximum 3 Blocks of Shifts Per Fortnight ---
             allow_fragmented = df.iloc[n]["Allow_Fragmented_Shifts"]
             
             if not allow_fragmented:
@@ -353,7 +350,14 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     model.Add(0 <= is_start_0)
                     
                 block_starts.append(is_start_0)
-                model.Add(sum(block_starts) <= 2)
+                
+                # Hard Constraint: Absolute maximum of 3 blocks
+                model.Add(sum(block_starts) <= 3)
+                
+                # Soft Constraint: Ideally 2 blocks. Penalty if 3.
+                third_block_active = model.NewBoolVar(f'third_block_staff_{n}')
+                model.Add(sum(block_starts) - 2 <= third_block_active)
+                fatigue_penalties.append(third_block_active * 25)
                     
             # 5. Minimum 2 Days Off AND Minimum 2 Working Days (Ban all fragmentation)
             if not allow_fragmented:
@@ -429,7 +433,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(dev >= -(am_shifts - pm_shifts))
                 shift_mix_penalties.append(dev * 4) 
 
-        # 3. Fatigue & Fairness Limits
+        # 3. Avoid excessive late-earlies
         late_earlies = []
         for d in range(num_days - 1):
             is_late_early = model.NewBoolVar(f'late_early_staff_{n}_day_{d}')
@@ -438,21 +442,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             
         model.Add(sum(late_earlies) <= (num_days // 14))
         penalties.extend(late_earlies)
-        
-        is_night_pool = df.iloc[n]["Night_Pool"]
-        shift_length = 10.0 if is_night_pool else 8.0
-        
-        base_target_hours = df.iloc[n]["EFT"] * 80.0 * (num_days / 14.0)
-        shifts_per_roster = math.ceil(base_target_hours / shift_length)
-        
-        ideal_max_consecutive = int((shifts_per_roster / 2) + 1)
-        
-        if ideal_max_consecutive < 6:
-            for d in range(num_days - ideal_max_consecutive):
-                over_consecutive = model.NewBoolVar(f'over_consec_{n}_{d}')
-                window_sum = sum(roster[(n, d+w, s)] for w in range(ideal_max_consecutive + 1) for s in range(3))
-                model.Add(window_sum - ideal_max_consecutive <= over_consecutive)
-                penalties.append(over_consecutive * 5)
 
         # 4. Maximize Preferred Shifts
         pref_shift = str(df.iloc[n].get("Preferred_Shift", "None"))
@@ -477,7 +466,14 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     pass
 
     # Feed ALL penalties and rewards into the final optimization
-    model.Minimize(sum(shift_mix_penalties) + sum(penalties) + sum(granular_penalties) + sum(leadership_penalties) + sum(staffing_level_penalties))              
+    model.Minimize(
+        sum(shift_mix_penalties) + 
+        sum(penalties) + 
+        sum(granular_penalties) + 
+        sum(leadership_penalties) + 
+        sum(staffing_level_penalties) +
+        sum(fatigue_penalties)
+    )              
     
     # EXECUTE THE SOLVER
     solver = cp_model.CpSolver()
@@ -603,6 +599,9 @@ if "staff_df" not in st.session_state:
 raw_df = st.session_state.staff_df.copy()
 
 missing_columns = {
+    "Night_Pool": False,
+    "Allow_Fragmented_Shifts": False,
+    "Entire_Roster_Leave": False,
     "Secondary_Role": "None",
     "Secondary_EFT": 0.0,
     "No_AM_DOW": "",
@@ -620,8 +619,7 @@ for col, default_val in missing_columns.items():
 
 bool_cols = ["Night_Pool", "Allow_Fragmented_Shifts", "Entire_Roster_Leave"]
 for col in bool_cols:
-    if col in raw_df.columns:
-        raw_df[col] = raw_df[col].astype(str).str.lower().isin(['true', '1', 't', 'yes'])
+    raw_df[col] = raw_df[col].astype(str).str.strip().str.lower().isin(['true', '1', 't', 'yes', 'y'])
 
 raw_df["EFT"] = pd.to_numeric(raw_df["EFT"], errors='coerce').fillna(1.0)
 raw_df["Secondary_EFT"] = pd.to_numeric(raw_df["Secondary_EFT"], errors='coerce').fillna(0.0)
@@ -660,7 +658,6 @@ edited_df = st.data_editor(
     }
 )
 
-# Put the buttons next to each other
 col1, col2 = st.columns(2)
 
 with col1:
@@ -678,7 +675,6 @@ with col2:
 
 if st.button("Generate Roster", type="primary"):
     with st.spinner("Calculating optimal shifts (this may take a few seconds)..."):
-        # Pass the debug flags into the solver!
         result_df = solve_roster(edited_df, roster_days, start_date, debug_flags)
         
         if result_df is not None:
