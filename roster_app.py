@@ -73,6 +73,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
     staffing_level_penalties = []
     leadership_penalties = []
 
+    # --- REFINED COVERAGE FLOORS (Max 1 Short) ---
     for d in all_days:
         current_date = start_date + datetime.timedelta(days=d)
         is_weekend = current_date.weekday() >= 5
@@ -85,18 +86,22 @@ def solve_roster(df, num_days, start_date, debug_flags):
         night_sum = sum(roster[(n, d, 2)] for n in all_staff)
         
         if not debug_flags.get("ignore_coverage"):
-            missing_am = model.NewIntVar(0, 10, f'missing_am_d{d}')
+            # Target 5, Max missing 1 -> Absolute floor is 4
+            missing_am = model.NewIntVar(0, 1, f'missing_am_d{d}')
             model.Add(am_sum + missing_am == 5)
             staffing_level_penalties.append(missing_am * (100 if (is_weekend or is_monday or is_pub_hol) else 50))
                 
-            missing_pm = model.NewIntVar(0, 10, f'missing_pm_d{d}')
+            # Target 5, Max missing 1 -> Absolute floor is 4
+            missing_pm = model.NewIntVar(0, 1, f'missing_pm_d{d}')
             model.Add(pm_sum + missing_pm == 5)
             staffing_level_penalties.append(missing_pm * (100 if (is_weekend or is_friday or is_pub_hol) else 50))
                 
+            # Target 4 on wknds, 3 on wkdays. Absolute floor is always 3.
             target_night = 4 if (is_weekend or is_pub_hol) else 3
-            missing_night = model.NewIntVar(0, 10, f'missing_night_d{d}')
+            missing_night = model.NewIntVar(0, target_night - 3, f'missing_night_d{d}')
             model.Add(night_sum + missing_night == target_night)
             staffing_level_penalties.append(missing_night * 100)
+    # ---------------------------------------------
             
     for d in all_days:
         for s in range(3):
@@ -203,7 +208,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             fatigue_penalties.append(shortfall * 200)
             fatigue_penalties.append(overage * 200)
 
-    # --- BUG FIXED: PARADOX-FREE FATIGUE RULES ---
     if not debug_flags.get("ignore_fatigue"):
         for n in all_staff:
             raw_prior = df.iloc[n]["Prior_Consecutive_Days"]
@@ -211,7 +215,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             last_shift = str(df.iloc[n]["Last_Shift_Type"]).strip()
             is_night_pool = df.iloc[n]["Night_Pool"]
             
-            # 1. HARD LAW: 8-Hour Min Rest Gap
             for d in range(num_days - 1):
                 model.AddImplication(roster[(n, d, 2)], roster[(n, d+1, 0)].Not())
                 model.AddImplication(roster[(n, d, 2)], roster[(n, d+1, 1)].Not())
@@ -220,7 +223,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(roster[(n, 0, 0)] == 0)
                 model.Add(roster[(n, 0, 1)] == 0)
                 
-            # 2. HARD LAW: Max Consecutive Shifts (Leave days no longer counted as shifts!)
             shift_length = 10.0 if is_night_pool else 8.0
             shifts_per_fortnight = math.ceil((df.iloc[n]["EFT"] * 80.0) / shift_length)
             max_consec = int((shifts_per_fortnight / 2) + 1)
@@ -245,12 +247,18 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 if num_days > 1:
                     for s in range(3): model.Add(roster[(n, 1, s)] == 0)
                         
-            # 3. ELASTIC BLOCKS: Min 2 On / Min 2 Off
-            # Fragmented shifts are now penalized heavily (50 pts) but will bend before breaking the roster
-            allow_fragmented = df.iloc[n]["Allow_Fragmented_Shifts"]
+            base_shifts = (df.iloc[n]["EFT"] * 80.0 * (num_days / 14.0)) / shift_length
+            valid_leave_days = len([d for d in parse_days(str(df.iloc[n]["Approved_Leave_Days"])) if 0 <= d < num_days])
+            study_count = len([d for d in parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))) if 0 <= d < num_days])
+            fraction_present = max(0.0, (num_days - valid_leave_days - study_count) / num_days)
+            final_target = round(base_shifts * fraction_present)
+            
+            if final_target == 1:
+                allow_fragmented = True
+            else:
+                allow_fragmented = df.iloc[n]["Allow_Fragmented_Shifts"]
             
             if not allow_fragmented:
-                # Limit internal transitions (ideally max 2 blocks of work per fortnight)
                 internal_starts = []
                 for d in range(1, num_days):
                     w_yest = sum(roster[(n, d-1, s)] for s in range(3) if (n, d-1, s) in roster)
@@ -259,37 +267,23 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     model.Add(w_tod - w_yest <= is_start)
                     internal_starts.append(is_start)
                 
+                model.Add(sum(internal_starts) <= 3)
                 extra_blocks = model.NewIntVar(0, 14, f'extra_blocks_{n}')
                 model.Add(sum(internal_starts) - 1 <= extra_blocks)
                 fatigue_penalties.append(extra_blocks * 50)
                     
+            if not allow_fragmented:
                 for d in range(num_days - 2):
                     w0 = sum(roster[(n, d, s)] for s in range(3) if (n, d, s) in roster)
                     w1 = sum(roster[(n, d+1, s)] for s in range(3) if (n, d+1, s) in roster)
                     w2 = sum(roster[(n, d+2, s)] for s in range(3) if (n, d+2, s) in roster)
-                    
-                    # Penalize isolated days off (Work-Off-Work)
-                    iso_off = model.NewBoolVar(f'iso_off_{n}_{d}')
-                    model.Add(w0 - w1 + w2 - 1 <= iso_off)
-                    fatigue_penalties.append(iso_off * 50)
-                    
-                    # Penalize isolated days on (Off-Work-Off)
-                    iso_work = model.NewBoolVar(f'iso_work_{n}_{d}')
-                    model.Add(w1 - w0 - w2 <= iso_work)
-                    fatigue_penalties.append(iso_work * 50)
+                    model.Add(w0 - w1 + w2 <= 1)
+                    model.Add(w1 - w0 - w2 <= 0)
                     
                 w0 = sum(roster[(n, 0, s)] for s in range(3) if (n, 0, s) in roster)
                 w1 = sum(roster[(n, 1, s)] for s in range(3) if (n, 1, s) in roster)
-                
-                if prior_days == 0 and num_days > 1: 
-                    iso_start_work = model.NewBoolVar(f'iso_sw_{n}')
-                    model.Add(w0 - w1 <= iso_start_work)
-                    fatigue_penalties.append(iso_start_work * 50)
-                    
-                if prior_days > 0 and num_days > 1: 
-                    iso_start_off = model.NewBoolVar(f'iso_so_{n}')
-                    model.Add(w1 - w0 <= iso_start_off)
-                    fatigue_penalties.append(iso_start_off * 50)
+                if prior_days == 0 and num_days > 1: model.Add(w0 - w1 <= 0)
+                if prior_days > 0 and num_days > 1: model.Add(w1 <= w0)
 
     shift_mix_penalties = []
     granular_penalties = []
@@ -572,4 +566,4 @@ if st.button("Generate Roster", type="primary"):
             csv = result_df.to_csv(index=False).encode('utf-8')
             st.download_button(label="Download Roster as CSV", data=csv, file_name='ward_roster.csv', mime='text/csv')
         else:
-            st.error("Engine failed to generate.")
+            st.error("Engine failed to generate. Minimum safe staffing floors could not be met. Try toggling 'Ignore Minimum Staff Levels' to identify the gaps.")
