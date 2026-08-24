@@ -258,7 +258,11 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 if num_days > 1:
                     for s in range(3): model.Add(roster[(n, 1, s)] == 0)
                         
-            allow_fragmented = df.iloc[n]["Allow_Fragmented_Shifts"]
+            # If their total target is 1 shift, automatically allow fragmentation so the engine doesn't crash!
+            if final_shift_target == 1:
+                allow_fragmented = True
+            else:
+                allow_fragmented = df.iloc[n]["Allow_Fragmented_Shifts"]
             if not allow_fragmented:
                 internal_starts = []
                 for d in range(1, num_days):
