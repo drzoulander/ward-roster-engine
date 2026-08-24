@@ -72,6 +72,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
     
     staffing_level_penalties = []
 
+    # --- FULLY ELASTIC PRIORITIZED COVERAGE ---
     for d in all_days:
         current_date = start_date + datetime.timedelta(days=d)
         is_weekend = current_date.weekday() >= 5
@@ -80,33 +81,43 @@ def solve_roster(df, num_days, start_date, debug_flags):
         is_pub_hol = current_date in vic_holidays
         
         am_sum = sum(roster[(n, d, 0)] for n in all_staff)
-        if not debug_flags.get("ignore_coverage"):
-            if is_weekend or is_monday or is_pub_hol:
-                model.Add(am_sum >= 4)
-                model.Add(am_sum <= 5)
-                missing_am = model.NewIntVar(0, 1, f'missing_am_d{d}')
-                model.Add(missing_am == 5 - am_sum)
-                staffing_level_penalties.append(missing_am * 40)
-            else:
-                model.Add(am_sum == 5)
-        
         pm_sum = sum(roster[(n, d, 1)] for n in all_staff)
+        night_sum = sum(roster[(n, d, 2)] for n in all_staff)
+        
         if not debug_flags.get("ignore_coverage"):
+            # 1. AM SHIFTS: Elastic (Range 4 to 5)
+            model.Add(am_sum >= 4)
+            model.Add(am_sum <= 5)
+            missing_am = model.NewIntVar(0, 1, f'missing_am_d{d}')
+            model.Add(missing_am == 5 - am_sum)
+            
+            if is_weekend or is_monday or is_pub_hol:
+                staffing_level_penalties.append(missing_am * 50) # High priority full staffing
+            else:
+                staffing_level_penalties.append(missing_am * 15) # Mid-week flexible drop to 4
+                
+            # 2. PM SHIFTS: Elastic (Range 4 to 5)
             model.Add(pm_sum >= 4)
             model.Add(pm_sum <= 5)
-            if is_weekend or is_friday or is_pub_hol:
-                missing_pm = model.NewIntVar(0, 1, f'missing_pm_d{d}')
-                model.Add(missing_pm == 5 - pm_sum)
-                staffing_level_penalties.append(missing_pm * 40)
+            missing_pm = model.NewIntVar(0, 1, f'missing_pm_d{d}')
+            model.Add(missing_pm == 5 - pm_sum)
             
-        night_sum = sum(roster[(n, d, 2)] for n in all_staff)
-        if not debug_flags.get("ignore_coverage"):
+            if is_weekend or is_friday or is_pub_hol:
+                staffing_level_penalties.append(missing_pm * 50) # High priority full staffing
+            else:
+                staffing_level_penalties.append(missing_pm * 15) # Mid-week flexible drop to 4
+                
+            # 3. NIGHT SHIFTS: Elastic (Range 3 to 4)
             model.Add(night_sum >= 3)
             model.Add(night_sum <= 4)
+            missing_night = model.NewIntVar(0, 1, f'missing_night_d{d}')
+            model.Add(missing_night == 4 - night_sum)
+            
             if is_weekend or is_pub_hol:
-                missing_weekend_night = model.NewIntVar(0, 1, f'missing_wknd_night_d{d}')
-                model.Add(missing_weekend_night == 4 - night_sum)
-                staffing_level_penalties.append(missing_weekend_night * 40)
+                staffing_level_penalties.append(missing_night * 50) # Weekend nights priority target 4
+            else:
+                staffing_level_penalties.append(missing_night * 20) # Weekday nights flexible drop to 3
+    # ------------------------------------------
             
     leadership_penalties = []
     for d in all_days:
@@ -134,7 +145,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             model.Add(missing_anum == 1 - anum_sum)
             leadership_penalties.append(missing_anum * 15)
             
-    # --- CONTROLLED BY TROUBLESHOOTER ---
     if not debug_flags.get("ignore_night_pool"):
         for n in all_staff:
             is_night_pool = df.iloc[n]["Night_Pool"]
@@ -351,11 +361,26 @@ def solve_roster(df, num_days, start_date, debug_flags):
 
         roster_output = []
         day_headers = []
+        
+        # Track shift totals for the summary rows
+        am_totals = []
+        pm_totals = []
+        night_totals = []
+        
         for d in all_days:
             current_date = start_date + datetime.timedelta(days=d)
             header = current_date.strftime("%a %d-%b") 
             if current_date in vic_holidays: header += " (PH)"
             day_headers.append(header)
+            
+            # Count actual staff assigned
+            a_sum = sum(1 for n in all_staff if (n, d, 0) in roster and solver.Value(roster[(n, d, 0)]) == 1)
+            p_sum = sum(1 for n in all_staff if (n, d, 1) in roster and solver.Value(roster[(n, d, 1)]) == 1)
+            n_sum = sum(1 for n in all_staff if (n, d, 2) in roster and solver.Value(roster[(n, d, 2)]) == 1)
+            
+            am_totals.append(a_sum)
+            pm_totals.append(p_sum)
+            night_totals.append(n_sum)
             
         for n in all_staff:
             staff_row = {"Staff ID": df.iloc[n]["ID"], "Role": df.iloc[n]["Role"]}
@@ -375,7 +400,50 @@ def solve_roster(df, num_days, start_date, debug_flags):
                             if (n, d, s) in acting_leaders: assigned_shift += " (Shift Leader)"
                 staff_row[day_headers[d]] = assigned_shift
             roster_output.append(staff_row)
-        return pd.DataFrame(roster_output)
+            
+        result_df = pd.DataFrame(roster_output)
+        
+        # --- ADD AGENCY / SHORTFALL SUMMARY ROWS ---
+        agency_am = []
+        agency_pm = []
+        agency_night = []
+        
+        for d in all_days:
+            current_date = start_date + datetime.timedelta(days=d)
+            is_weekend = current_date.weekday() >= 5
+            is_monday = current_date.weekday() == 0
+            is_friday = current_date.weekday() == 4
+            is_pub_hol = current_date in vic_holidays
+            
+            # Target AM is 5
+            target_am = 5
+            short_am = max(0, target_am - am_totals[d])
+            agency_am.append(f"Short {short_am} (Agency)" if short_am > 0 else "Fully Staffed")
+            
+            # Target PM is 5
+            target_pm = 5
+            short_pm = max(0, target_pm - pm_totals[d])
+            agency_pm.append(f"Short {short_pm} (Agency)" if short_pm > 0 else "Fully Staffed")
+            
+            # Target Night is 4 on weekends/PH, 3 or 4 on weekdays
+            target_night = 4 if (is_weekend or is_pub_hol) else 3
+            short_night = max(0, target_night - night_totals[d])
+            agency_night.append(f"Short {short_night} (Agency)" if short_night > 0 else "Fully Staffed")
+            
+        summary_row_am = {"Staff ID": "🚨 AM Shortfall", "Role": "AGENCY CHECK"}
+        summary_row_pm = {"Staff ID": "🚨 PM Shortfall", "Role": "AGENCY CHECK"}
+        summary_row_night = {"Staff ID": "🚨 Night Shortfall", "Role": "AGENCY CHECK"}
+        
+        for idx, h in enumerate(day_headers):
+            summary_row_am[h] = agency_am[idx]
+            summary_row_pm[h] = agency_pm[idx]
+            summary_row_night[h] = agency_night[idx]
+            
+        summary_df = pd.DataFrame([summary_row_am, summary_row_pm, summary_row_night])
+        final_output_df = pd.concat([result_df, summary_df], ignore_index=True)
+        # -------------------------------------------
+        
+        return final_output_df
     else:
         return None
 
@@ -388,7 +456,7 @@ st.markdown("Adjust the staff parameters below, then click generate.")
 
 with st.sidebar:
     st.header("Roster Settings")
-    start_date = start_date = st.date_input("Roster Start Date", datetime.date.today())
+    start_date = st.date_input("Roster Start Date", datetime.date.today())
     roster_days = st.slider("Roster Length (Days)", min_value=14, max_value=182, value=14, step=7)
     
     st.markdown("---")
@@ -399,7 +467,7 @@ with st.sidebar:
         "ignore_fatigue": st.checkbox("Ignore Fatigue & Rest Rules"),
         "ignore_leave": st.checkbox("Ignore Approved Leave"),
         "ignore_eft": st.checkbox("Ignore Contract EFT Targets"),
-        "ignore_night_pool": st.checkbox("Ignore Night Pool Separation (Allows Day/Night cross-over)")
+        "ignore_night_pool": st.checkbox("Ignore Night Pool Separation")
     }
 
 conn = st.connection("gsheets", type=GSheetsConnection)
@@ -495,4 +563,4 @@ if st.button("Generate Roster", type="primary"):
             csv = result_df.to_csv(index=False).encode('utf-8')
             st.download_button(label="Download Roster as CSV", data=csv, file_name='ward_roster.csv', mime='text/csv')
         else:
-            st.error("No feasible roster could be generated. Turn on all 6 checkboxes in the sidebar Troubleshooter to isolate the final wall.")
+            st.error("No feasible roster could be generated. Check your leave balances or turn on Troubleshooter flags.")
