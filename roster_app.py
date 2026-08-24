@@ -91,7 +91,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             model.Add(am_sum <= 5)
             missing_am = model.NewIntVar(0, 1, f'missing_am_d{d}')
             model.Add(missing_am == 5 - am_sum)
-            # Extreme penalty for priority shifts, standard penalty for mid-week
             staffing_level_penalties.append(missing_am * (500 if (is_weekend or is_monday or is_pub_hol) else 200))
                 
             # PM: Strict Ceiling 5, Floor 4
@@ -102,13 +101,16 @@ def solve_roster(df, num_days, start_date, debug_flags):
             staffing_level_penalties.append(missing_pm * (500 if (is_weekend or is_friday or is_pub_hol) else 200))
                 
             # Night: Strict Ceiling 4, Floor 3 (every day)
+            target_night = 4 if (is_weekend or is_pub_hol) else 3
             model.Add(night_sum >= 3)
             model.Add(night_sum <= 4)
+            
             missing_night = model.NewIntVar(0, 1, f'missing_night_d{d}')
             model.Add(missing_night == 4 - night_sum)
             staffing_level_penalties.append(missing_night * (500 if (is_weekend or is_pub_hol) else 200))
     # ----------------------------------------
             
+    # --- BUG FIXED: NO MORE RN (IN CHARGE) CEILING ---
     for d in all_days:
         for s in range(3):
             if not debug_flags.get("ignore_leadership"):
@@ -126,13 +128,20 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     sum(role_secondary[(n, d, s)] for n in all_staff if df.iloc[n]["Secondary_Role"] == "RN (In Charge)" and (n, d, s) in role_secondary)
                 )
                 
-                missing_any_leader = model.NewIntVar(0, 2, f'missing_any_leader_d{d}_s{s}')
-                model.Add(anum_sum + rn_in_charge_sum + missing_any_leader == 2)
-                leadership_penalties.append(missing_any_leader * 80)
+                # Strict Max 1 ANUM
+                model.Add(anum_sum <= 1)
                 
+                # Ideally 1 ANUM (Penalty if 0)
                 missing_anum = model.NewIntVar(0, 1, f'missing_anum_d{d}_s{s}')
                 model.Add(missing_anum >= 1 - anum_sum)
                 leadership_penalties.append(missing_anum * 40)
+                
+                # Target: At least 2 total leaders (ANUM + RN In Charge)
+                # This explicitly ALLOWS 3, 4, or 5 leaders on a shift without crashing!
+                missing_any_leader = model.NewIntVar(0, 2, f'missing_any_leader_d{d}_s{s}')
+                model.Add(missing_any_leader >= 2 - (anum_sum + rn_in_charge_sum))
+                leadership_penalties.append(missing_any_leader * 80)
+    # --------------------------------------------------
             
     if not debug_flags.get("ignore_night_pool"):
         for n in all_staff:
@@ -170,7 +179,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
 
     fatigue_penalties = []
     
-    # --- STRICT EFT ADHERENCE ---
+    # --- IRONCLAD EFT ADHERENCE (Penalty Multiplier 100,000) ---
     for n in all_staff:
         is_fully_absent = df.iloc[n].get("Entire_Roster_Leave", False)
         has_secondary = df.iloc[n]["Secondary_Role"] != "None" and df.iloc[n]["Secondary_EFT"] > 0
@@ -203,8 +212,8 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 sec_short = model.NewIntVar(0, 14, f'sec_short_{n}')
                 sec_over = model.NewIntVar(0, 14, f'sec_over_{n}')
                 model.Add(actual_sec_shifts == sec_shift_target - sec_short + sec_over)
-                fatigue_penalties.append(sec_short * 2000)
-                fatigue_penalties.append(sec_over * 2000)
+                fatigue_penalties.append(sec_short * 100000)
+                fatigue_penalties.append(sec_over * 100000)
             
         if not debug_flags.get("ignore_eft"):
             actual_shifts = sum(roster[(n, d, s)] for d in range(num_days) for s in range(3) if (n, d, s) in roster)
@@ -212,10 +221,10 @@ def solve_roster(df, num_days, start_date, debug_flags):
             overage = model.NewIntVar(0, 14, f'eft_over_{n}')
             
             model.Add(actual_shifts == final_shift_target - shortfall + overage)
-            # Massive 2000 penalty forces the engine to respect EFT above almost all other soft rules
-            fatigue_penalties.append(shortfall * 2000)
-            fatigue_penalties.append(overage * 2000)
-    # ----------------------------
+            # Pseudo-Hard Constraint: The solver will override almost all other rules to hit this target
+            fatigue_penalties.append(shortfall * 100000)
+            fatigue_penalties.append(overage * 100000)
+    # -------------------------------------------------------------
 
     if not debug_flags.get("ignore_fatigue"):
         for n in all_staff:
@@ -440,15 +449,19 @@ def solve_roster(df, num_days, start_date, debug_flags):
         agency_pm = []
         agency_night = []
         
-        # --- FIXED AGENCY REPORTING TARGETS ---
         for d in all_days:
+            current_date = start_date + datetime.timedelta(days=d)
+            is_weekend = current_date.weekday() >= 5
+            is_pub_hol = current_date in vic_holidays
+            
             short_am = max(0, 5 - am_totals[d])
             agency_am.append(f"Short {short_am} (Agency)" if short_am > 0 else "Fully Staffed")
             
             short_pm = max(0, 5 - pm_totals[d])
             agency_pm.append(f"Short {short_pm} (Agency)" if short_pm > 0 else "Fully Staffed")
             
-            short_night = max(0, 4 - night_totals[d])
+            target_night = 4 if (is_weekend or is_pub_hol) else 3
+            short_night = max(0, target_night - night_totals[d])
             agency_night.append(f"Short {short_night} (Agency)" if short_night > 0 else "Fully Staffed")
             
         summary_row_am = {"Staff ID": "🚨 AM Shortfall", "Role": "AGENCY CHECK"}
@@ -581,4 +594,4 @@ if st.button("Generate Roster", type="primary"):
             csv = result_df.to_csv(index=False).encode('utf-8')
             st.download_button(label="Download Roster as CSV", data=csv, file_name='ward_roster.csv', mime='text/csv')
         else:
-            st.error("Engine failed to generate. Minimum safe staffing floors could not be met. Try toggling 'Ignore Minimum Staff Levels' to identify the gaps.")
+            st.error("Engine failed to generate. A hard safety limit (max 1 short) or a physical leave limit was hit.")
