@@ -73,7 +73,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
     staffing_level_penalties = []
     leadership_penalties = []
 
-    # --- PURE OPTIMIZER COVERAGE (NO HARD FLOORS) ---
+    # --- PURE OPTIMIZER COVERAGE ---
     for d in all_days:
         current_date = start_date + datetime.timedelta(days=d)
         is_weekend = current_date.weekday() >= 5
@@ -86,40 +86,28 @@ def solve_roster(df, num_days, start_date, debug_flags):
         night_sum = sum(roster[(n, d, 2)] for n in all_staff)
         
         if not debug_flags.get("ignore_coverage"):
-            # AM SHIFTS
             missing_am = model.NewIntVar(0, 10, f'missing_am_d{d}')
             model.Add(am_sum + missing_am == 5)
-            if is_weekend or is_monday or is_pub_hol:
-                staffing_level_penalties.append(missing_am * 100) # Maximum priority
-            else:
-                staffing_level_penalties.append(missing_am * 50)  # Mid-week
+            staffing_level_penalties.append(missing_am * (100 if (is_weekend or is_monday or is_pub_hol) else 50))
                 
-            # PM SHIFTS
             missing_pm = model.NewIntVar(0, 10, f'missing_pm_d{d}')
             model.Add(pm_sum + missing_pm == 5)
-            if is_weekend or is_friday or is_pub_hol:
-                staffing_level_penalties.append(missing_pm * 100)
-            else:
-                staffing_level_penalties.append(missing_pm * 50)
+            staffing_level_penalties.append(missing_pm * (100 if (is_weekend or is_friday or is_pub_hol) else 50))
                 
-            # NIGHT SHIFTS
             target_night = 4 if (is_weekend or is_pub_hol) else 3
             missing_night = model.NewIntVar(0, 10, f'missing_night_d{d}')
             model.Add(night_sum + missing_night == target_night)
             staffing_level_penalties.append(missing_night * 100)
-    # ------------------------------------------
             
-    # --- PURE OPTIMIZER LEADERSHIP (NO HARD FLOORS) ---
+    # --- PURE OPTIMIZER LEADERSHIP ---
     for d in all_days:
         for s in range(3):
             if not debug_flags.get("ignore_leadership"):
-                # Soft Gender Mix
                 females_on_shift = sum(roster[(n, d, s)] for n in females if (n, d, s) in roster)
                 missing_female = model.NewIntVar(0, 1, f'missing_fem_d{d}_s{s}')
                 model.Add(females_on_shift + missing_female >= 1)
                 leadership_penalties.append(missing_female * 30)
             
-                # Soft Leadership Mix
                 anum_sum = (
                     sum(role_primary[(n, d, s)] for n in all_staff if df.iloc[n]["Role"] == "ANUM" and (n, d, s) in role_primary) + 
                     sum(role_secondary[(n, d, s)] for n in all_staff if df.iloc[n]["Secondary_Role"] == "ANUM" and (n, d, s) in role_secondary)
@@ -129,16 +117,13 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     sum(role_secondary[(n, d, s)] for n in all_staff if df.iloc[n]["Secondary_Role"] == "RN (In Charge)" and (n, d, s) in role_secondary)
                 )
                 
-                # Ideally 2 leaders (ANUM + RN In Charge)
                 missing_any_leader = model.NewIntVar(0, 2, f'missing_any_leader_d{d}_s{s}')
                 model.Add(anum_sum + rn_in_charge_sum + missing_any_leader == 2)
-                leadership_penalties.append(missing_any_leader * 80) # Huge penalty to protect leadership
+                leadership_penalties.append(missing_any_leader * 80)
                 
-                # Ideally 1 ANUM
                 missing_anum = model.NewIntVar(0, 1, f'missing_anum_d{d}_s{s}')
                 model.Add(missing_anum >= 1 - anum_sum)
                 leadership_penalties.append(missing_anum * 40)
-    # ------------------------------------------
             
     if not debug_flags.get("ignore_night_pool"):
         for n in all_staff:
@@ -174,6 +159,9 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 if current_date.strftime("%A").lower() in dow_str:
                     for s in range(3): model.Add(roster[(n, d, s)] == 0)
 
+    # --- PURE OPTIMIZER EFT (ELASTIC TARGETS) ---
+    fatigue_penalties = []
+    
     for n in all_staff:
         is_fully_absent = df.iloc[n].get("Entire_Roster_Leave", False)
         has_secondary = df.iloc[n]["Secondary_Role"] != "None" and df.iloc[n]["Secondary_EFT"] > 0
@@ -197,16 +185,35 @@ def solve_roster(df, num_days, start_date, debug_flags):
             fraction_present = max(0.0, (num_days - valid_leave_days - study_count) / num_days)
             final_shift_target = round(base_shifts * fraction_present)
             
+            # ELASTIC SECONDARY ROLE EFT
             if has_secondary and not debug_flags.get("ignore_eft"):
                 sec_base = (secondary_eft * 80.0 * (num_days / 14.0)) / shift_length
                 sec_shift_target = round(sec_base * fraction_present)
                 sec_shift_target = min(sec_shift_target, final_shift_target)
-                model.Add(sum(role_secondary[(n, d, s)] for d in range(num_days) for s in range(3) if (n, d, s) in role_secondary) == sec_shift_target)
+                
+                actual_sec_shifts = sum(role_secondary[(n, d, s)] for d in range(num_days) for s in range(3) if (n, d, s) in role_secondary)
+                sec_short = model.NewIntVar(0, 14, f'sec_short_{n}')
+                sec_over = model.NewIntVar(0, 14, f'sec_over_{n}')
+                model.Add(actual_sec_shifts == sec_shift_target - sec_short + sec_over)
+                
+                # Penalty 150 ensures it strongly prefers hitting the target, but allows it to flex if trapped
+                fatigue_penalties.append(sec_short * 150)
+                fatigue_penalties.append(sec_over * 150)
             
+        # ELASTIC PRIMARY EFT
         if not debug_flags.get("ignore_eft"):
-            model.Add(sum(roster[(n, d, s)] for d in range(num_days) for s in range(3) if (n, d, s) in roster) == final_shift_target)
+            actual_shifts = sum(roster[(n, d, s)] for d in range(num_days) for s in range(3) if (n, d, s) in roster)
+            shortfall = model.NewIntVar(0, 14, f'eft_short_{n}')
+            overage = model.NewIntVar(0, 14, f'eft_over_{n}')
+            
+            model.Add(actual_shifts == final_shift_target - shortfall + overage)
+            
+            # Huge Penalty 200: It will break RDOs (30) and leave shifts short (100) before it over/under-works a nurse.
+            # But if a physical fatigue wall exists, it will safely drop the shift and take the penalty instead of crashing.
+            fatigue_penalties.append(shortfall * 200)
+            fatigue_penalties.append(overage * 200)
 
-    fatigue_penalties = []
+    # --- FATIGUE RULES ---
     if not debug_flags.get("ignore_fatigue"):
         for n in all_staff:
             raw_prior = df.iloc[n]["Prior_Consecutive_Days"]
@@ -222,11 +229,9 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.AddImplication(roster[(n, d, 2)], roster[(n, d+1, 0)].Not())
                 model.AddImplication(roster[(n, d, 2)], roster[(n, d+1, 1)].Not())
                 
-            # --- PM TO AM FIX: REMOVED HARD BAN ---
             if last_shift == "Night":
                 model.Add(roster[(n, 0, 0)] == 0)
                 model.Add(roster[(n, 0, 1)] == 0)
-            # --------------------------------------
                 
             shift_length = 10.0 if is_night_pool else 8.0
             shifts_per_fortnight = math.ceil((df.iloc[n]["EFT"] * 80.0) / shift_length)
@@ -254,7 +259,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 if num_days > 1:
                     for s in range(3): model.Add(roster[(n, 1, s)] == 0)
                         
-            # EXCEPTION: If the calculated target is exactly 1 shift, allow fragmentation to prevent impossible math crash!
             base_shifts = (df.iloc[n]["EFT"] * 80.0 * (num_days / 14.0)) / shift_length
             valid_leave_days = len([d for d in parse_days(str(df.iloc[n]["Approved_Leave_Days"])) if 0 <= d < num_days])
             study_count = len([d for d in parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))) if 0 <= d < num_days])
@@ -297,7 +301,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
     granular_penalties = []
     penalties = []
     
-    # --- PM TO AM LATE-EARLY TRACKING FIX ---
     for n in all_staff:
         late_earlies = []
         last_shift = str(df.iloc[n].get("Last_Shift_Type", "")).strip()
@@ -474,7 +477,7 @@ with st.sidebar:
     st.markdown("---")
     st.header("🛠️ Constraint Troubleshooter")
     debug_flags = {
-        "ignore_coverage": st.checkbox("Ignore Minimum Staff Levels (Turns off Agency Flagging)"),
+        "ignore_coverage": st.checkbox("Ignore Minimum Staff Levels"),
         "ignore_leadership": st.checkbox("Ignore Leadership Minimums"),
         "ignore_fatigue": st.checkbox("Ignore Fatigue & Rest Rules"),
         "ignore_leave": st.checkbox("Ignore Approved Leave"),
@@ -575,4 +578,4 @@ if st.button("Generate Roster", type="primary"):
             csv = result_df.to_csv(index=False).encode('utf-8')
             st.download_button(label="Download Roster as CSV", data=csv, file_name='ward_roster.csv', mime='text/csv')
         else:
-            st.error("No feasible roster could be generated. Ensure you haven't assigned a Day worker to a Night shift preference without ignoring Night Pool Separation.")
+            st.error("Engine failed to generate. Please check that you haven't assigned a Day Worker to a Night preference without unchecking the Night Pool rule.")
