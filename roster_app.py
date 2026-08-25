@@ -79,7 +79,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
     staffing_level_penalties = []
     leadership_penalties = []
 
-    # --- STRICT CEILINGS & 1-SHORT FLOORS ---
     for d in all_days:
         current_date = start_date + datetime.timedelta(days=d)
         is_weekend = current_date.weekday() >= 5
@@ -112,7 +111,13 @@ def solve_roster(df, num_days, start_date, debug_flags):
             model.Add(missing_night == 4 - night_sum)
             staffing_level_penalties.append(missing_night * (500 if (is_weekend or is_pub_hol) else 200))
             
-    # --- CASCADING LEADER SELECTION ---
+        # --- FIXED: STRICT EN/LEARNER CEILING ---
+        for s in range(3):
+            en_count = sum(roster[(n, d, s)] for n in all_staff if df.iloc[n]["Role"] == "EN/Learner")
+            if not debug_flags.get("ignore_coverage"):
+                model.Add(en_count <= 2)
+        # ----------------------------------------
+            
     is_leader = {}
     for d in all_days:
         for s in range(3):
@@ -129,11 +134,16 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(females_on_shift + missing_female >= 1)
                 leadership_penalties.append(missing_female * 30)
             
+            # --- FIXED: ANUM OVERSTAFFING PREVENTION ---
             anum_sum = sum(role_primary[(n, d, s)] for n in all_staff if df.iloc[n]["Role"] == "ANUM") + sum(role_secondary[(n, d, s)] for n in all_staff if df.iloc[n]["Secondary_Role"] == "ANUM")
             rn_in_charge_sum = sum(role_primary[(n, d, s)] for n in all_staff if df.iloc[n]["Role"] == "RN (In Charge)") + sum(role_secondary[(n, d, s)] for n in all_staff if df.iloc[n]["Secondary_Role"] == "RN (In Charge)")
             
             if not debug_flags.get("ignore_leadership"):
-                model.Add(anum_sum <= 1)
+                total_anums_on_shift = sum(roster[(n, d, s)] for n in all_staff if df.iloc[n]["Role"] == "ANUM")
+                excess_anum = model.NewIntVar(0, 10, f'excess_anum_d{d}_s{s}')
+                model.Add(total_anums_on_shift - 1 <= excess_anum)
+                leadership_penalties.append(excess_anum * 800) # Spreads ANUMs safely before doubling up
+                
                 missing_anum = model.NewIntVar(0, 1, f'missing_anum_d{d}_s{s}')
                 model.Add(missing_anum >= 1 - anum_sum)
                 leadership_penalties.append(missing_anum * 40)
@@ -218,7 +228,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
 
     fatigue_penalties = []
     
-    # --- EFT ADHERENCE ---
     for n in all_staff:
         is_fully_absent = df.iloc[n].get("Entire_Roster_Leave", False)
         has_secondary = df.iloc[n]["Secondary_Role"] != "None" and df.iloc[n]["Secondary_EFT"] > 0
@@ -236,10 +245,8 @@ def solve_roster(df, num_days, start_date, debug_flags):
             shift_length = 10.0 if is_night_pool else 8.0
             
             base_shifts = (total_eft * 80.0 * (num_days / 14.0)) / shift_length
-            
             valid_leave_days = len([d for d in parse_days(str(df.iloc[n]["Approved_Leave_Days"])) if 0 <= d < num_days])
             fraction_present = max(0.0, (num_days - valid_leave_days) / num_days)
-            
             clinical_shifts_after_leave = math.ceil(base_shifts * fraction_present)
             
             study_count = len([d for d in parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))) if 0 <= d < num_days])
@@ -266,7 +273,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             fatigue_penalties.append(shortfall * 100000)
             fatigue_penalties.append(overage * 100000)
 
-    # --- ADVANCED CONTINUITY-AWARE FATIGUE RULES ---
     if not debug_flags.get("ignore_fatigue"):
         for n in all_staff:
             raw_prior = df.iloc[n]["Prior_Consecutive_Days"]
@@ -286,19 +292,26 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(roster[(n, 0, 0)] == 0)
                 model.Add(roster[(n, 0, 1)] == 0)
                 
+            # --- FIXED: STUDY LEAVE NIGHT BANS ---
+            for sd in study_days_set:
+                if 0 <= sd < num_days:
+                    if sd - 1 >= 0:
+                        model.Add(roster[(n, sd-1, 2)] == 0)
+                    if sd - 2 >= 0:
+                        model.Add(roster[(n, sd-2, 2)] == 0)
+            # -------------------------------------
+                
             shift_length = 10.0 if is_night_pool else 8.0
             total_eft_fatigue = df.iloc[n]["EFT"] + (df.iloc[n]["Secondary_EFT"] if df.iloc[n]["Secondary_Role"] != "None" else 0.0)
             base_shifts_fatigue = math.ceil((total_eft_fatigue * 80.0) / shift_length)
             
             ext_count = len([d for d in ext_days_set if 0 <= d < num_days])
             total_shifts_for_fatigue = base_shifts_fatigue + ext_count
-            
             max_consec = int((total_shifts_for_fatigue / 2) + 1)
             
             for d in range(num_days - max_consec):
                 ward_shifts = sum(roster[(n, d+w, s)] for w in range(max_consec + 1) for s in range(3) if (n, d+w, s) in roster)
                 virtual_shifts = sum(1 for w in range(max_consec + 1) if (d+w) in virtual_work_days)
-                
                 if virtual_shifts <= max_consec:
                     model.Add(ward_shifts <= max_consec - virtual_shifts)
                 else:
@@ -327,14 +340,11 @@ def solve_roster(df, num_days, start_date, debug_flags):
             valid_leave_days = len([d for d in parse_days(str(df.iloc[n]["Approved_Leave_Days"])) if 0 <= d < num_days])
             fraction_present = max(0.0, (num_days - valid_leave_days) / num_days)
             clinical_shifts_after_leave = math.ceil(base_shifts_fatigue * fraction_present)
-            
             study_count = len([d for d in parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))) if 0 <= d < num_days])
             final_target = max(0, clinical_shifts_after_leave - study_count)
             
-            if final_target == 1:
-                allow_fragmented = True
-            else:
-                allow_fragmented = df.iloc[n]["Allow_Fragmented_Shifts"]
+            if final_target == 1: allow_fragmented = True
+            else: allow_fragmented = df.iloc[n]["Allow_Fragmented_Shifts"]
             
             if not allow_fragmented:
                 internal_starts = []
@@ -353,31 +363,24 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(sum(internal_starts) - 1 <= extra_blocks)
                 fatigue_penalties.append(extra_blocks * 400)
                     
+                # --- FIXED: UNBREAKABLE 2-DAY MINIMUMS ---
                 for d in range(num_days - 2):
                     w0 = sum(roster[(n, d, s)] for s in range(3) if (n, d, s) in roster) + (1 if d in virtual_work_days else 0)
                     w1 = sum(roster[(n, d+1, s)] for s in range(3) if (n, d+1, s) in roster) + (1 if d+1 in virtual_work_days else 0)
                     w2 = sum(roster[(n, d+2, s)] for s in range(3) if (n, d+2, s) in roster) + (1 if d+2 in virtual_work_days else 0)
                     
-                    iso_off = model.NewBoolVar(f'iso_off_n{n}_d{d}')
-                    model.Add(w0 - w1 + w2 - 1 <= iso_off)
-                    fatigue_penalties.append(iso_off * 400)
-                    
-                    iso_on = model.NewBoolVar(f'iso_on_n{n}_d{d}')
-                    model.Add(w1 - w0 - w2 <= iso_on)
-                    fatigue_penalties.append(iso_on * 400)
+                    # Hard ban on isolated days off and isolated days on
+                    model.Add(w0 - w1 + w2 <= 1)
+                    model.Add(w1 - w0 - w2 <= 0)
                     
                 w0 = sum(roster[(n, 0, s)] for s in range(3) if (n, 0, s) in roster) + (1 if 0 in virtual_work_days else 0)
                 w1 = sum(roster[(n, 1, s)] for s in range(3) if (n, 1, s) in roster) + (1 if 1 in virtual_work_days else 0)
                 if prior_days == 0 and num_days > 1: 
-                    iso_sw = model.NewBoolVar(f'iso_sw_{n}')
-                    model.Add(w0 - w1 <= iso_sw)
-                    fatigue_penalties.append(iso_sw * 400)
+                    model.Add(w0 - w1 <= 0)
                 if prior_days > 0 and num_days > 1: 
-                    iso_so = model.NewBoolVar(f'iso_so_{n}')
-                    model.Add(w1 - w0 <= iso_so)
-                    fatigue_penalties.append(iso_so * 400)
+                    model.Add(w1 - w0 <= 0)
+                # ------------------------------------------
 
-            # --- FORWARD ROTATION (Start PM / End AM) ---
             if not is_night_pool:
                 for d in range(1, num_days):
                     w_yest = sum(roster[(n, d-1, s)] for s in range(3)) + (1 if (d-1) in virtual_work_days else 0)
@@ -410,6 +413,13 @@ def solve_roster(df, num_days, start_date, debug_flags):
             is_late_early = model.NewBoolVar(f'late_early_staff_{n}_day_{d}')
             model.Add(roster[(n, d, 1)] + roster[(n, d+1, 0)] - 1 <= is_late_early)
             late_earlies.append(is_late_early)
+            
+        study_days_set = set(parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))))
+        for sd in study_days_set:
+            if sd - 1 >= 0:
+                is_le_study = model.NewBoolVar(f'le_study_{n}_d{sd}')
+                model.Add(roster[(n, sd-1, 1)] <= is_le_study)
+                late_earlies.append(is_le_study)
             
         excess_le = model.NewIntVar(0, 14, f'excess_le_{n}')
         model.Add(sum(late_earlies) - (num_days // 14) <= excess_le)
@@ -738,7 +748,6 @@ if st.button("Generate Roster", type="primary"):
             st.subheader("🏥 Final Ward Roster")
             st.dataframe(result_df, use_container_width=True)
             
-            # --- NEW EXCEL DOWNLOAD LOGIC ---
             try:
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
@@ -763,6 +772,5 @@ if st.button("Generate Roster", type="primary"):
                     file_name='ward_roster_combined.csv', 
                     mime='text/csv'
                 )
-            # --------------------------------
         else:
             st.error("Engine failed to generate. Minimum safe staffing floors could not be met, or EFT demands exceed physical ward slots. Check the capacity dashboard above.")
