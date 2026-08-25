@@ -78,7 +78,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
     staffing_level_penalties = []
     leadership_penalties = []
 
-    # --- STRICT CEILINGS & 1-SHORT FLOORS ---
     for d in all_days:
         current_date = start_date + datetime.timedelta(days=d)
         is_weekend = current_date.weekday() >= 5
@@ -169,7 +168,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
 
     fatigue_penalties = []
     
-    # --- UPGRADED EFT ADHERENCE ---
     for n in all_staff:
         is_fully_absent = df.iloc[n].get("Entire_Roster_Leave", False)
         has_secondary = df.iloc[n]["Secondary_Role"] != "None" and df.iloc[n]["Secondary_EFT"] > 0
@@ -194,7 +192,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             clinical_shifts_after_leave = math.ceil(base_shifts * fraction_present)
             
             study_count = len([d for d in parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))) if 0 <= d < num_days])
-            
             final_shift_target = max(0, clinical_shifts_after_leave - study_count)
             
             if has_secondary and not debug_flags.get("ignore_eft"):
@@ -218,7 +215,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
             fatigue_penalties.append(shortfall * 100000)
             fatigue_penalties.append(overage * 100000)
 
-    # --- CONTINUITY-AWARE FATIGUE RULES ---
+    # --- ADVANCED CONTINUITY-AWARE FATIGUE RULES ---
     if not debug_flags.get("ignore_fatigue"):
         for n in all_staff:
             raw_prior = df.iloc[n]["Prior_Consecutive_Days"]
@@ -226,7 +223,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             last_shift = str(df.iloc[n]["Last_Shift_Type"]).strip()
             is_night_pool = df.iloc[n]["Night_Pool"]
             
-            # Virtual work days act as block magnets
             study_days_set = set(parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))))
             ext_days_set = set(parse_days(str(df.iloc[n].get("External_Working_Days", ""))))
             virtual_work_days = study_days_set | ext_days_set
@@ -239,10 +235,15 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(roster[(n, 0, 0)] == 0)
                 model.Add(roster[(n, 0, 1)] == 0)
                 
+            # FIXED: Max Consec Calculation includes External Days
             shift_length = 10.0 if is_night_pool else 8.0
             total_eft_fatigue = df.iloc[n]["EFT"] + (df.iloc[n]["Secondary_EFT"] if df.iloc[n]["Secondary_Role"] != "None" else 0.0)
-            shifts_per_fortnight = math.ceil((total_eft_fatigue * 80.0) / shift_length)
-            max_consec = int((shifts_per_fortnight / 2) + 1)
+            base_shifts_fatigue = math.ceil((total_eft_fatigue * 80.0) / shift_length)
+            
+            ext_count = len([d for d in ext_days_set if 0 <= d < num_days])
+            total_shifts_for_fatigue = base_shifts_fatigue + ext_count
+            
+            max_consec = int((total_shifts_for_fatigue / 2) + 1)
             
             for d in range(num_days - max_consec):
                 ward_shifts = sum(roster[(n, d+w, s)] for w in range(max_consec + 1) for s in range(3) if (n, d+w, s) in roster)
@@ -273,7 +274,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 if num_days > 1:
                     for s in range(3): model.Add(roster[(n, 1, s)] == 0)
                         
-            base_shifts_fatigue = (total_eft_fatigue * 80.0 * (num_days / 14.0)) / shift_length
             valid_leave_days = len([d for d in parse_days(str(df.iloc[n]["Approved_Leave_Days"])) if 0 <= d < num_days])
             fraction_present = max(0.0, (num_days - valid_leave_days) / num_days)
             clinical_shifts_after_leave = math.ceil(base_shifts_fatigue * fraction_present)
@@ -299,9 +299,10 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     model.Add(w_tod - w_yest <= is_start)
                     internal_starts.append(is_start)
                 
+                # FIXED: Massive 400 point penalty ensures shifts stick to external blocks
                 extra_blocks = model.NewIntVar(0, 14, f'extra_blocks_{n}')
                 model.Add(sum(internal_starts) - 1 <= extra_blocks)
-                fatigue_penalties.append(extra_blocks * 50)
+                fatigue_penalties.append(extra_blocks * 400)
                     
                 for d in range(num_days - 2):
                     w0 = sum(roster[(n, d, s)] for s in range(3) if (n, d, s) in roster) + (1 if d in virtual_work_days else 0)
@@ -310,22 +311,22 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     
                     iso_off = model.NewBoolVar(f'iso_off_n{n}_d{d}')
                     model.Add(w0 - w1 + w2 - 1 <= iso_off)
-                    fatigue_penalties.append(iso_off * 50)
+                    fatigue_penalties.append(iso_off * 400)
                     
                     iso_on = model.NewBoolVar(f'iso_on_n{n}_d{d}')
                     model.Add(w1 - w0 - w2 <= iso_on)
-                    fatigue_penalties.append(iso_on * 50)
+                    fatigue_penalties.append(iso_on * 400)
                     
                 w0 = sum(roster[(n, 0, s)] for s in range(3) if (n, 0, s) in roster) + (1 if 0 in virtual_work_days else 0)
                 w1 = sum(roster[(n, 1, s)] for s in range(3) if (n, 1, s) in roster) + (1 if 1 in virtual_work_days else 0)
                 if prior_days == 0 and num_days > 1: 
                     iso_sw = model.NewBoolVar(f'iso_sw_{n}')
                     model.Add(w0 - w1 <= iso_sw)
-                    fatigue_penalties.append(iso_sw * 50)
+                    fatigue_penalties.append(iso_sw * 400)
                 if prior_days > 0 and num_days > 1: 
                     iso_so = model.NewBoolVar(f'iso_so_{n}')
                     model.Add(w1 - w0 <= iso_so)
-                    fatigue_penalties.append(iso_so * 50)
+                    fatigue_penalties.append(iso_so * 400)
 
     shift_mix_penalties = []
     granular_penalties = []
