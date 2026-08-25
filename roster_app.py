@@ -78,7 +78,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
     staffing_level_penalties = []
     leadership_penalties = []
 
-    # --- STRICT CEILINGS & 1-SHORT FLOORS ---
     for d in all_days:
         current_date = start_date + datetime.timedelta(days=d)
         is_weekend = current_date.weekday() >= 5
@@ -90,28 +89,29 @@ def solve_roster(df, num_days, start_date, debug_flags):
         pm_sum = sum(roster[(n, d, 1)] for n in all_staff)
         night_sum = sum(roster[(n, d, 2)] for n in all_staff)
         
+        # --- FIXED: IRONCLAD CEILINGS (Never > 5 or 4) ---
+        model.Add(am_sum <= 5)
+        model.Add(pm_sum <= 5)
+        model.Add(night_sum <= 4)
+        # -------------------------------------------------
+        
         if not debug_flags.get("ignore_coverage"):
             model.Add(am_sum >= 4)
-            model.Add(am_sum <= 5)
             missing_am = model.NewIntVar(0, 1, f'missing_am_d{d}')
             model.Add(missing_am == 5 - am_sum)
             staffing_level_penalties.append(missing_am * (500 if (is_weekend or is_monday or is_pub_hol) else 200))
                 
             model.Add(pm_sum >= 4)
-            model.Add(pm_sum <= 5)
             missing_pm = model.NewIntVar(0, 1, f'missing_pm_d{d}')
             model.Add(missing_pm == 5 - pm_sum)
             staffing_level_penalties.append(missing_pm * (500 if (is_weekend or is_friday or is_pub_hol) else 200))
                 
             target_night = 4 if (is_weekend or is_pub_hol) else 3
             model.Add(night_sum >= 3)
-            model.Add(night_sum <= 4)
-            
             missing_night = model.NewIntVar(0, 1, f'missing_night_d{d}')
             model.Add(missing_night == 4 - night_sum)
             staffing_level_penalties.append(missing_night * (500 if (is_weekend or is_pub_hol) else 200))
             
-    # --- CASCADING LEADER SELECTION ---
     is_leader = {}
     for d in all_days:
         for s in range(3):
@@ -167,7 +167,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
                         role_str = df.iloc[n]["Role"]
                         sec_str = df.iloc[n]["Secondary_Role"]
                         if role_str == "ANUM" or sec_str == "ANUM":
-                            pass # 0 cost for ANUM
+                            pass 
                         else:
                             if df.iloc[n].get("Prefer_Not_In_Charge", False):
                                 leadership_penalties.append(is_ldr * 50)
@@ -188,7 +188,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 excess_leader = model.NewIntVar(0, 14, f'excess_leader_{n}')
                 model.Add(leader_count - 1 <= excess_leader)
                 leadership_penalties.append(excess_leader * 200)
-    # ----------------------------------------
             
     if not debug_flags.get("ignore_night_pool"):
         for n in all_staff:
@@ -269,7 +268,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             fatigue_penalties.append(shortfall * 100000)
             fatigue_penalties.append(overage * 100000)
 
-    # --- ADVANCED CONTINUITY-AWARE FATIGUE RULES ---
     if not debug_flags.get("ignore_fatigue"):
         for n in all_staff:
             raw_prior = df.iloc[n]["Prior_Consecutive_Days"]
@@ -514,15 +512,17 @@ def solve_roster(df, num_days, start_date, debug_flags):
         agency_pm = []
         agency_night = []
         
-        # --- FIXED UI REPORTING TO REFLECT TRUE WARD TARGETS ---
         for d in all_days:
+            current_date = start_date + datetime.timedelta(days=d)
+            is_weekend = current_date.weekday() >= 5
+            is_pub_hol = current_date in vic_holidays
+            
             short_am = max(0, 5 - am_totals[d])
             agency_am.append(f"Short {short_am} (Agency)" if short_am > 0 else "Fully Staffed")
             
             short_pm = max(0, 5 - pm_totals[d])
             agency_pm.append(f"Short {short_pm} (Agency)" if short_pm > 0 else "Fully Staffed")
             
-            # Night is strictly 4 globally for reporting UI
             short_night = max(0, 4 - night_totals[d])
             agency_night.append(f"Short {short_night} (Agency)" if short_night > 0 else "Fully Staffed")
             
@@ -545,23 +545,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
 # ----------------------------------------
 st.set_page_config(layout="wide", page_title="Ward Rostering Engine")
 st.title("Automated Ward Rostering Engine")
-st.markdown("Adjust the staff parameters below, then click generate.")
-
-with st.sidebar:
-    st.header("Roster Settings")
-    start_date = st.date_input("Roster Start Date", datetime.date.today())
-    roster_days = st.slider("Roster Length (Days)", min_value=14, max_value=182, value=14, step=7)
-    
-    st.markdown("---")
-    st.header("🛠️ Constraint Troubleshooter")
-    debug_flags = {
-        "ignore_coverage": st.checkbox("Ignore Minimum Staff Levels"),
-        "ignore_leadership": st.checkbox("Ignore Leadership Minimums"),
-        "ignore_fatigue": st.checkbox("Ignore Fatigue & Rest Rules"),
-        "ignore_leave": st.checkbox("Ignore Approved Leave"),
-        "ignore_eft": st.checkbox("Ignore Contract EFT Targets"),
-        "ignore_night_pool": st.checkbox("Ignore Night Pool Separation")
-    }
 
 conn = st.connection("gsheets", type=GSheetsConnection)
 SHEET_URL = "Ward Staff Profiles" 
@@ -605,6 +588,56 @@ for col in raw_df.columns:
         raw_df[col] = raw_df[col].astype(str).str.replace(r'\.0$', '', regex=True).replace('nan', '')
 
 st.session_state.staff_df = raw_df
+
+# --- NEW WARD CAPACITY DASHBOARD ---
+def parse_days_length(day_string):
+    if pd.isna(day_string) or day_string.strip() == "" or day_string.strip() == "nan": return 0
+    try: return len([int(x.strip()) - 1 for x in day_string.split(",")])
+    except: return 0
+
+total_day_shifts_needed = 0
+total_night_shifts_needed = 0
+
+for _, row in st.session_state.staff_df.iterrows():
+    if row["Entire_Roster_Leave"]: continue
+    
+    total_eft = row["EFT"] + row["Secondary_EFT"]
+    shift_len = 10.0 if row["Night_Pool"] else 8.0
+    base_shifts = (total_eft * 80.0) / shift_len
+    
+    valid_leave = parse_days_length(row["Approved_Leave_Days"])
+    study_leave = parse_days_length(row["Study_Leave_Days"])
+    
+    fraction = max(0.0, (14 - valid_leave) / 14)
+    target = max(0, math.ceil(base_shifts * fraction) - study_leave)
+    
+    if row["Night_Pool"]: total_night_shifts_needed += target
+    else: total_day_shifts_needed += target
+
+col_a, col_b, col_c = st.columns(3)
+col_a.metric("Total Day Shifts Contracted", total_day_shifts_needed, delta=f"{140 - total_day_shifts_needed} Empty Ward Slots", delta_color="normal" if 140 >= total_day_shifts_needed else "inverse")
+col_b.metric("Total Night Shifts Contracted", total_night_shifts_needed, delta=f"{56 - total_night_shifts_needed} Empty Ward Slots", delta_color="normal" if 56 >= total_night_shifts_needed else "inverse")
+if total_day_shifts_needed > 140 or total_night_shifts_needed > 56:
+    st.error("🚨 **WARNING: Ward Over-Contracted!** Your staff legally require more shifts than the physical ward can hold. You MUST use the Troubleshooter to bypass the shift ceilings, or the roster will crash.")
+# -----------------------------------
+
+st.markdown("---")
+
+with st.sidebar:
+    st.header("Roster Settings")
+    start_date = st.date_input("Roster Start Date", datetime.date.today())
+    roster_days = st.slider("Roster Length (Days)", min_value=14, max_value=182, value=14, step=7)
+    
+    st.markdown("---")
+    st.header("🛠️ Constraint Troubleshooter")
+    debug_flags = {
+        "ignore_coverage": st.checkbox("Ignore Minimum Staff Levels (Floor Limits)"),
+        "ignore_leadership": st.checkbox("Ignore Leadership Minimums"),
+        "ignore_fatigue": st.checkbox("Ignore Fatigue & Rest Rules"),
+        "ignore_leave": st.checkbox("Ignore Approved Leave"),
+        "ignore_eft": st.checkbox("Ignore Contract EFT Targets"),
+        "ignore_night_pool": st.checkbox("Ignore Night Pool Separation")
+    }
 
 st.subheader("Staff Pool Management")
 edited_df = st.data_editor(
@@ -657,4 +690,4 @@ if st.button("Generate Roster", type="primary"):
             csv = result_df.to_csv(index=False).encode('utf-8')
             st.download_button(label="Download Roster as CSV", data=csv, file_name='ward_roster.csv', mime='text/csv')
         else:
-            st.error("Engine failed to generate. Minimum safe staffing floors could not be met. Try toggling 'Ignore Minimum Staff Levels' to identify the gaps.")
+            st.error("Engine failed to generate. Minimum safe staffing floors could not be met, or EFT demands exceed physical ward slots. Check the capacity dashboard above.")
