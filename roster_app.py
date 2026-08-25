@@ -111,12 +111,10 @@ def solve_roster(df, num_days, start_date, debug_flags):
             model.Add(missing_night == 4 - night_sum)
             staffing_level_penalties.append(missing_night * (500 if (is_weekend or is_pub_hol) else 200))
             
-        # --- FIXED: STRICT EN/LEARNER CEILING ---
         for s in range(3):
             en_count = sum(roster[(n, d, s)] for n in all_staff if df.iloc[n]["Role"] == "EN/Learner")
             if not debug_flags.get("ignore_coverage"):
                 model.Add(en_count <= 2)
-        # ----------------------------------------
             
     is_leader = {}
     for d in all_days:
@@ -134,7 +132,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(females_on_shift + missing_female >= 1)
                 leadership_penalties.append(missing_female * 30)
             
-            # --- FIXED: ANUM OVERSTAFFING PREVENTION ---
             anum_sum = sum(role_primary[(n, d, s)] for n in all_staff if df.iloc[n]["Role"] == "ANUM") + sum(role_secondary[(n, d, s)] for n in all_staff if df.iloc[n]["Secondary_Role"] == "ANUM")
             rn_in_charge_sum = sum(role_primary[(n, d, s)] for n in all_staff if df.iloc[n]["Role"] == "RN (In Charge)") + sum(role_secondary[(n, d, s)] for n in all_staff if df.iloc[n]["Secondary_Role"] == "RN (In Charge)")
             
@@ -142,7 +139,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 total_anums_on_shift = sum(roster[(n, d, s)] for n in all_staff if df.iloc[n]["Role"] == "ANUM")
                 excess_anum = model.NewIntVar(0, 10, f'excess_anum_d{d}_s{s}')
                 model.Add(total_anums_on_shift - 1 <= excess_anum)
-                leadership_penalties.append(excess_anum * 800) # Spreads ANUMs safely before doubling up
+                leadership_penalties.append(excess_anum * 800)
                 
                 missing_anum = model.NewIntVar(0, 1, f'missing_anum_d{d}_s{s}')
                 model.Add(missing_anum >= 1 - anum_sum)
@@ -268,7 +265,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             actual_shifts = sum(roster[(n, d, s)] for d in range(num_days) for s in range(3) if (n, d, s) in roster)
             shortfall = model.NewIntVar(0, 14, f'eft_short_{n}')
             overage = model.NewIntVar(0, 14, f'eft_over_{n}')
-            
             model.Add(actual_shifts == final_shift_target - shortfall + overage)
             fatigue_penalties.append(shortfall * 100000)
             fatigue_penalties.append(overage * 100000)
@@ -292,14 +288,12 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(roster[(n, 0, 0)] == 0)
                 model.Add(roster[(n, 0, 1)] == 0)
                 
-            # --- FIXED: STUDY LEAVE NIGHT BANS ---
             for sd in study_days_set:
                 if 0 <= sd < num_days:
                     if sd - 1 >= 0:
                         model.Add(roster[(n, sd-1, 2)] == 0)
                     if sd - 2 >= 0:
                         model.Add(roster[(n, sd-2, 2)] == 0)
-            # -------------------------------------
                 
             shift_length = 10.0 if is_night_pool else 8.0
             total_eft_fatigue = df.iloc[n]["EFT"] + (df.iloc[n]["Secondary_EFT"] if df.iloc[n]["Secondary_Role"] != "None" else 0.0)
@@ -363,23 +357,31 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(sum(internal_starts) - 1 <= extra_blocks)
                 fatigue_penalties.append(extra_blocks * 400)
                     
-                # --- FIXED: UNBREAKABLE 2-DAY MINIMUMS ---
+                # --- PSEUDO-HARD 2-DAY MINIMUMS (Penalty 20,000 avoids paradox crashes) ---
                 for d in range(num_days - 2):
                     w0 = sum(roster[(n, d, s)] for s in range(3) if (n, d, s) in roster) + (1 if d in virtual_work_days else 0)
                     w1 = sum(roster[(n, d+1, s)] for s in range(3) if (n, d+1, s) in roster) + (1 if d+1 in virtual_work_days else 0)
                     w2 = sum(roster[(n, d+2, s)] for s in range(3) if (n, d+2, s) in roster) + (1 if d+2 in virtual_work_days else 0)
                     
-                    # Hard ban on isolated days off and isolated days on
-                    model.Add(w0 - w1 + w2 <= 1)
-                    model.Add(w1 - w0 - w2 <= 0)
+                    iso_off = model.NewBoolVar(f'iso_off_n{n}_d{d}')
+                    model.Add(w0 - w1 + w2 - 1 <= iso_off)
+                    fatigue_penalties.append(iso_off * 20000)
+                    
+                    iso_on = model.NewBoolVar(f'iso_on_n{n}_d{d}')
+                    model.Add(w1 - w0 - w2 <= iso_on)
+                    fatigue_penalties.append(iso_on * 20000)
                     
                 w0 = sum(roster[(n, 0, s)] for s in range(3) if (n, 0, s) in roster) + (1 if 0 in virtual_work_days else 0)
                 w1 = sum(roster[(n, 1, s)] for s in range(3) if (n, 1, s) in roster) + (1 if 1 in virtual_work_days else 0)
                 if prior_days == 0 and num_days > 1: 
-                    model.Add(w0 - w1 <= 0)
+                    iso_sw = model.NewBoolVar(f'iso_sw_{n}')
+                    model.Add(w0 - w1 <= iso_sw)
+                    fatigue_penalties.append(iso_sw * 20000)
                 if prior_days > 0 and num_days > 1: 
-                    model.Add(w1 - w0 <= 0)
-                # ------------------------------------------
+                    iso_so = model.NewBoolVar(f'iso_so_{n}')
+                    model.Add(w1 - w0 <= iso_so)
+                    fatigue_penalties.append(iso_so * 20000)
+                # --------------------------------------------------------------------------
 
             if not is_night_pool:
                 for d in range(1, num_days):
@@ -773,4 +775,4 @@ if st.button("Generate Roster", type="primary"):
                     mime='text/csv'
                 )
         else:
-            st.error("Engine failed to generate. Minimum safe staffing floors could not be met, or EFT demands exceed physical ward slots. Check the capacity dashboard above.")
+            st.error("Engine failed to generate. A hard mathematical paradox exists (usually caused by a requested RDO blocking a required EFT shift).")
