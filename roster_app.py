@@ -28,7 +28,7 @@ def load_initial_staff():
             "Secondary_Role": "None", "Secondary_EFT": 0.0,
             "No_AM_DOW": "", "No_PM_DOW": "", "Preferred_Shift": "None",
             "Study_Leave_Days": "", "External_Working_Days": "",
-            "W1_Preferences": "", "W2_Preferences": ""
+            "W1_Preferences": "", "W2_Preferences": "", "Prefer_Not_In_Charge": False
         })
     return pd.DataFrame(staff_data)
 
@@ -78,6 +78,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
     staffing_level_penalties = []
     leadership_penalties = []
 
+    # --- STRICT CEILINGS & 1-SHORT FLOORS ---
     for d in all_days:
         current_date = start_date + datetime.timedelta(days=d)
         is_weekend = current_date.weekday() >= 5
@@ -110,23 +111,27 @@ def solve_roster(df, num_days, start_date, debug_flags):
             model.Add(missing_night == 4 - night_sum)
             staffing_level_penalties.append(missing_night * (500 if (is_weekend or is_pub_hol) else 200))
             
+    # --- CASCADING LEADER SELECTION ---
+    is_leader = {}
     for d in all_days:
         for s in range(3):
+            shift_leader_vars = []
+            shift_active = model.NewBoolVar(f'shift_active_{d}_{s}')
+            
+            total_staff_working = sum(roster[(n, d, s)] for n in all_staff)
+            model.Add(total_staff_working > 0).OnlyEnforceIf(shift_active)
+            model.Add(total_staff_working == 0).OnlyEnforceIf(shift_active.Not())
+            
             if not debug_flags.get("ignore_leadership"):
                 females_on_shift = sum(roster[(n, d, s)] for n in females if (n, d, s) in roster)
                 missing_female = model.NewIntVar(0, 1, f'missing_fem_d{d}_s{s}')
                 model.Add(females_on_shift + missing_female >= 1)
                 leadership_penalties.append(missing_female * 30)
             
-                anum_sum = (
-                    sum(role_primary[(n, d, s)] for n in all_staff if df.iloc[n]["Role"] == "ANUM" and (n, d, s) in role_primary) + 
-                    sum(role_secondary[(n, d, s)] for n in all_staff if df.iloc[n]["Secondary_Role"] == "ANUM" and (n, d, s) in role_secondary)
-                )
-                rn_in_charge_sum = (
-                    sum(role_primary[(n, d, s)] for n in all_staff if df.iloc[n]["Role"] == "RN (In Charge)" and (n, d, s) in role_primary) + 
-                    sum(role_secondary[(n, d, s)] for n in all_staff if df.iloc[n]["Secondary_Role"] == "RN (In Charge)" and (n, d, s) in role_secondary)
-                )
-                
+            anum_sum = sum(role_primary[(n, d, s)] for n in all_staff if df.iloc[n]["Role"] == "ANUM") + sum(role_secondary[(n, d, s)] for n in all_staff if df.iloc[n]["Secondary_Role"] == "ANUM")
+            rn_in_charge_sum = sum(role_primary[(n, d, s)] for n in all_staff if df.iloc[n]["Role"] == "RN (In Charge)") + sum(role_secondary[(n, d, s)] for n in all_staff if df.iloc[n]["Secondary_Role"] == "RN (In Charge)")
+            
+            if not debug_flags.get("ignore_leadership"):
                 model.Add(anum_sum <= 1)
                 
                 missing_anum = model.NewIntVar(0, 1, f'missing_anum_d{d}_s{s}')
@@ -136,6 +141,54 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 missing_any_leader = model.NewIntVar(0, 2, f'missing_any_leader_d{d}_s{s}')
                 model.Add(missing_any_leader >= 2 - (anum_sum + rn_in_charge_sum))
                 leadership_penalties.append(missing_any_leader * 80)
+
+            for n in all_staff:
+                is_ldr = model.NewBoolVar(f'is_leader_{n}_{d}_{s}')
+                is_leader[(n, d, s)] = is_ldr
+                
+                is_prim_ldr = 1 if df.iloc[n]["Role"] in ["ANUM", "RN (In Charge)"] else 0
+                is_sec_ldr = 1 if df.iloc[n]["Secondary_Role"] in ["ANUM", "RN (In Charge)"] else 0
+                
+                can_be_leader = model.NewBoolVar(f'can_be_leader_{n}_{d}_{s}')
+                if is_prim_ldr and is_sec_ldr:
+                    model.Add(can_be_leader == roster[(n, d, s)])
+                elif is_prim_ldr:
+                    model.Add(can_be_leader == role_primary[(n, d, s)])
+                elif is_sec_ldr:
+                    model.Add(can_be_leader == role_secondary[(n, d, s)])
+                else:
+                    model.Add(can_be_leader == 0)
+                    
+                model.Add(is_ldr <= can_be_leader)
+                shift_leader_vars.append(is_ldr)
+                
+                if not debug_flags.get("ignore_leadership"):
+                    if is_prim_ldr or is_sec_ldr:
+                        role_str = df.iloc[n]["Role"]
+                        sec_str = df.iloc[n]["Secondary_Role"]
+                        if role_str == "ANUM" or sec_str == "ANUM":
+                            pass # 0 cost for ANUM
+                        else:
+                            if df.iloc[n].get("Prefer_Not_In_Charge", False):
+                                leadership_penalties.append(is_ldr * 50)
+                            else:
+                                leadership_penalties.append(is_ldr * 10)
+                                
+            no_leader = model.NewBoolVar(f'no_leader_{d}_{s}')
+            model.Add(sum(shift_leader_vars) + no_leader == 1).OnlyEnforceIf(shift_active)
+            model.Add(sum(shift_leader_vars) == 0).OnlyEnforceIf(shift_active.Not())
+            
+            if not debug_flags.get("ignore_leadership"):
+                leadership_penalties.append(no_leader * 1000)
+
+    if not debug_flags.get("ignore_leadership"):
+        for n in all_staff:
+            if df.iloc[n].get("Prefer_Not_In_Charge", False):
+                leader_count = sum(is_leader[(n, d, s)] for d in all_days for s in range(3))
+                excess_leader = model.NewIntVar(0, 14, f'excess_leader_{n}')
+                model.Add(leader_count - 1 <= excess_leader)
+                leadership_penalties.append(excess_leader * 200)
+    # ----------------------------------------
             
     if not debug_flags.get("ignore_night_pool"):
         for n in all_staff:
@@ -168,6 +221,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
 
     fatigue_penalties = []
     
+    # --- EFT ADHERENCE ---
     for n in all_staff:
         is_fully_absent = df.iloc[n].get("Entire_Roster_Leave", False)
         has_secondary = df.iloc[n]["Secondary_Role"] != "None" and df.iloc[n]["Secondary_EFT"] > 0
@@ -235,7 +289,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(roster[(n, 0, 0)] == 0)
                 model.Add(roster[(n, 0, 1)] == 0)
                 
-            # FIXED: Max Consec Calculation includes External Days
             shift_length = 10.0 if is_night_pool else 8.0
             total_eft_fatigue = df.iloc[n]["EFT"] + (df.iloc[n]["Secondary_EFT"] if df.iloc[n]["Secondary_Role"] != "None" else 0.0)
             base_shifts_fatigue = math.ceil((total_eft_fatigue * 80.0) / shift_length)
@@ -299,7 +352,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     model.Add(w_tod - w_yest <= is_start)
                     internal_starts.append(is_start)
                 
-                # FIXED: Massive 400 point penalty ensures shifts stick to external blocks
                 extra_blocks = model.NewIntVar(0, 14, f'extra_blocks_{n}')
                 model.Add(sum(internal_starts) - 1 <= extra_blocks)
                 fatigue_penalties.append(extra_blocks * 400)
@@ -406,17 +458,14 @@ def solve_roster(df, num_days, start_date, debug_flags):
         acting_leaders = set()
         for d in all_days:
             for s in range(3):
-                anum_present = False
-                rn_in_charges = []
                 for n in all_staff:
-                    if (n, d, s) in roster and solver.Value(roster[(n, d, s)]) == 1:
+                    if (n, d, s) in is_leader and solver.Value(is_leader[(n, d, s)]) == 1:
                         active_role = df.iloc[n]["Role"]
                         if (n, d, s) in role_secondary and solver.Value(role_secondary[(n, d, s)]) == 1:
                             active_role = df.iloc[n]["Secondary_Role"]
-                        if active_role == "ANUM": anum_present = True
-                        elif active_role == "RN (In Charge)": rn_in_charges.append(n)
-                if not anum_present and len(rn_in_charges) > 0:
-                    acting_leaders.add((rn_in_charges[0], d, s))
+                        
+                        if active_role != "ANUM":
+                            acting_leaders.add((n, d, s))
 
         roster_output = []
         day_headers = []
@@ -465,19 +514,16 @@ def solve_roster(df, num_days, start_date, debug_flags):
         agency_pm = []
         agency_night = []
         
+        # --- FIXED UI REPORTING TO REFLECT TRUE WARD TARGETS ---
         for d in all_days:
-            current_date = start_date + datetime.timedelta(days=d)
-            is_weekend = current_date.weekday() >= 5
-            is_pub_hol = current_date in vic_holidays
-            
             short_am = max(0, 5 - am_totals[d])
             agency_am.append(f"Short {short_am} (Agency)" if short_am > 0 else "Fully Staffed")
             
             short_pm = max(0, 5 - pm_totals[d])
             agency_pm.append(f"Short {short_pm} (Agency)" if short_pm > 0 else "Fully Staffed")
             
-            target_night = 4 if (is_weekend or is_pub_hol) else 3
-            short_night = max(0, target_night - night_totals[d])
+            # Night is strictly 4 globally for reporting UI
+            short_night = max(0, 4 - night_totals[d])
             agency_night.append(f"Short {short_night} (Agency)" if short_night > 0 else "Fully Staffed")
             
         summary_row_am = {"Staff ID": "🚨 AM Shortfall", "Role": "AGENCY CHECK"}
@@ -533,7 +579,7 @@ raw_df.columns = raw_df.columns.str.strip()
 missing_columns = {
     "Secondary_Role": "None", "Secondary_EFT": 0.0, "No_AM_DOW": "", "No_PM_DOW": "",
     "Preferred_Shift": "None", "Study_Leave_Days": "", "External_Working_Days": "",
-    "W1_Preferences": "", "W2_Preferences": ""
+    "W1_Preferences": "", "W2_Preferences": "", "Prefer_Not_In_Charge": False
 }
 for col, default_val in missing_columns.items():
     if col not in raw_df.columns: raw_df[col] = default_val
@@ -545,7 +591,7 @@ def make_boolean(val):
     if val_str in ['TRUE', '1', '1.0', 'T', 'YES', 'Y']: return True
     return False
 
-bool_cols = ["Night_Pool", "Allow_Fragmented_Shifts", "Entire_Roster_Leave"]
+bool_cols = ["Night_Pool", "Allow_Fragmented_Shifts", "Entire_Roster_Leave", "Prefer_Not_In_Charge"]
 for col in bool_cols:
     if col not in raw_df.columns: raw_df[col] = False
     raw_df[col] = raw_df[col].apply(make_boolean).astype(bool)
@@ -565,6 +611,7 @@ edited_df = st.data_editor(
     st.session_state.staff_df, num_rows="dynamic", use_container_width=True,
     column_config={
         "Night_Pool": st.column_config.CheckboxColumn("Night Pool?", default=False),
+        "Prefer_Not_In_Charge": st.column_config.CheckboxColumn("Prefer Not In Charge", default=False),
         "Approved_Leave_Days": st.column_config.TextColumn("Approved Leave"),
         "Requested_RDOs": st.column_config.TextColumn("Requested RDOs"),
         "EFT": st.column_config.NumberColumn("EFT", min_value=0.1, max_value=1.0, step=0.1),
