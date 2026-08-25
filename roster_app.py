@@ -4,6 +4,7 @@ import os
 import datetime
 import holidays
 import math
+import io
 from ortools.sat.python import cp_model
 from streamlit_gsheets import GSheetsConnection
 
@@ -235,8 +236,10 @@ def solve_roster(df, num_days, start_date, debug_flags):
             shift_length = 10.0 if is_night_pool else 8.0
             
             base_shifts = (total_eft * 80.0 * (num_days / 14.0)) / shift_length
+            
             valid_leave_days = len([d for d in parse_days(str(df.iloc[n]["Approved_Leave_Days"])) if 0 <= d < num_days])
             fraction_present = max(0.0, (num_days - valid_leave_days) / num_days)
+            
             clinical_shifts_after_leave = math.ceil(base_shifts * fraction_present)
             
             study_count = len([d for d in parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))) if 0 <= d < num_days])
@@ -258,11 +261,12 @@ def solve_roster(df, num_days, start_date, debug_flags):
             actual_shifts = sum(roster[(n, d, s)] for d in range(num_days) for s in range(3) if (n, d, s) in roster)
             shortfall = model.NewIntVar(0, 14, f'eft_short_{n}')
             overage = model.NewIntVar(0, 14, f'eft_over_{n}')
+            
             model.Add(actual_shifts == final_shift_target - shortfall + overage)
             fatigue_penalties.append(shortfall * 100000)
             fatigue_penalties.append(overage * 100000)
 
-    # --- FATIGUE & FORWARD ROTATION RULES ---
+    # --- ADVANCED CONTINUITY-AWARE FATIGUE RULES ---
     if not debug_flags.get("ignore_fatigue"):
         for n in all_staff:
             raw_prior = df.iloc[n]["Prior_Consecutive_Days"]
@@ -288,11 +292,13 @@ def solve_roster(df, num_days, start_date, debug_flags):
             
             ext_count = len([d for d in ext_days_set if 0 <= d < num_days])
             total_shifts_for_fatigue = base_shifts_fatigue + ext_count
+            
             max_consec = int((total_shifts_for_fatigue / 2) + 1)
             
             for d in range(num_days - max_consec):
                 ward_shifts = sum(roster[(n, d+w, s)] for w in range(max_consec + 1) for s in range(3) if (n, d+w, s) in roster)
                 virtual_shifts = sum(1 for w in range(max_consec + 1) if (d+w) in virtual_work_days)
+                
                 if virtual_shifts <= max_consec:
                     model.Add(ward_shifts <= max_consec - virtual_shifts)
                 else:
@@ -321,11 +327,14 @@ def solve_roster(df, num_days, start_date, debug_flags):
             valid_leave_days = len([d for d in parse_days(str(df.iloc[n]["Approved_Leave_Days"])) if 0 <= d < num_days])
             fraction_present = max(0.0, (num_days - valid_leave_days) / num_days)
             clinical_shifts_after_leave = math.ceil(base_shifts_fatigue * fraction_present)
+            
             study_count = len([d for d in parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))) if 0 <= d < num_days])
             final_target = max(0, clinical_shifts_after_leave - study_count)
             
-            if final_target == 1: allow_fragmented = True
-            else: allow_fragmented = df.iloc[n]["Allow_Fragmented_Shifts"]
+            if final_target == 1:
+                allow_fragmented = True
+            else:
+                allow_fragmented = df.iloc[n]["Allow_Fragmented_Shifts"]
             
             if not allow_fragmented:
                 internal_starts = []
@@ -370,7 +379,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
 
             # --- FORWARD ROTATION (Start PM / End AM) ---
             if not is_night_pool:
-                # Penalty if block starts on AM (after day off)
                 for d in range(1, num_days):
                     w_yest = sum(roster[(n, d-1, s)] for s in range(3)) + (1 if (d-1) in virtual_work_days else 0)
                     am_tod = roster[(n, d, 0)]
@@ -378,7 +386,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     model.Add(am_tod - w_yest <= bad_start)
                     fatigue_penalties.append(bad_start * 8)
                     
-                # Penalty if block ends on PM (before day off)
                 for d in range(num_days - 1):
                     w_tom = sum(roster[(n, d+1, s)] for s in range(3)) + (1 if (d+1) in virtual_work_days else 0)
                     pm_tod = roster[(n, d, 1)]
@@ -388,7 +395,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     
                 if prior_days == 0 and 0 not in virtual_work_days:
                     fatigue_penalties.append(roster[(n, 0, 0)] * 8)
-            # --------------------------------------------
 
     shift_mix_penalties = []
     granular_penalties = []
@@ -407,7 +413,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             
         excess_le = model.NewIntVar(0, 14, f'excess_le_{n}')
         model.Add(sum(late_earlies) - (num_days // 14) <= excess_le)
-        # 40 point penalty strictly controls late-earlies to max 1 per fortnight
         penalties.append(excess_le * 40)
         penalties.extend(late_earlies)
 
@@ -495,7 +500,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             night_totals.append(sum(1 for n in all_staff if (n, d, 2) in roster and solver.Value(roster[(n, d, 2)]) == 1))
             
         for n in all_staff:
-            # Generate Roster Row
             staff_row = {"Staff ID": df.iloc[n]["ID"], "Role": df.iloc[n]["Role"]}
             
             study_days_list = parse_days(str(df.iloc[n].get("Study_Leave_Days", "")))
@@ -520,7 +524,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 staff_row[day_headers[d]] = assigned_shift
             roster_output.append(staff_row)
             
-            # Generate Tally Row
             is_fully_absent = df.iloc[n].get("Entire_Roster_Leave", False)
             if is_fully_absent:
                 target_shifts = 0
@@ -735,7 +738,31 @@ if st.button("Generate Roster", type="primary"):
             st.subheader("🏥 Final Ward Roster")
             st.dataframe(result_df, use_container_width=True)
             
-            csv = result_df.to_csv(index=False).encode('utf-8')
-            st.download_button(label="Download Roster as CSV", data=csv, file_name='ward_roster.csv', mime='text/csv')
+            # --- NEW EXCEL DOWNLOAD LOGIC ---
+            try:
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                    result_df.to_excel(writer, sheet_name='Ward Roster', index=False)
+                    tally_df.to_excel(writer, sheet_name='Staff Tally', index=False)
+                
+                st.download_button(
+                    label="📥 Download Complete Spreadsheet (Excel)",
+                    data=buffer.getvalue(),
+                    file_name='ward_roster_complete.xlsx',
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                )
+            except ImportError:
+                st.info("💡 Tip: Run `pip install xlsxwriter` in your terminal to get a multi-tab Excel file. Falling back to a combined CSV.")
+                csv_roster = result_df.to_csv(index=False)
+                csv_tally = tally_df.to_csv(index=False)
+                combined_csv = f"WARD ROSTER\n{csv_roster}\n\nSTAFF CONTRACT TALLY\n{csv_tally}"
+                
+                st.download_button(
+                    label="📥 Download Combined Spreadsheet (CSV)", 
+                    data=combined_csv.encode('utf-8'), 
+                    file_name='ward_roster_combined.csv', 
+                    mime='text/csv'
+                )
+            # --------------------------------
         else:
             st.error("Engine failed to generate. Minimum safe staffing floors could not be met, or EFT demands exceed physical ward slots. Check the capacity dashboard above.")
