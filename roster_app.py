@@ -109,7 +109,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
         pm_sum = sum(roster[(n, d, 1)] for n in all_staff)
         night_sum = sum(roster[(n, d, 2)] for n in all_staff)
         
-        # IRONCLAD CEILINGS - Mathematically impossible to exceed 5
         model.Add(am_sum <= 5)
         model.Add(pm_sum <= 5)
         model.Add(night_sum <= 4)
@@ -332,6 +331,9 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 else:
                     model.Add(ward_shifts == 0)
                 
+            for d in range(num_days - 4):
+                model.Add(sum(roster[(n, d+w, 2)] for w in range(5)) <= 4)
+                
             if prior_days > 0:
                 days_to_check = (max_consec + 1) - prior_days
                 remaining_allowed = max(0, max_consec - prior_days)
@@ -343,18 +345,15 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     else:
                         model.Add(ward_boundary == 0)
 
-            for d in range(num_days - 4):
-                model.Add(sum(roster[(n, d+w, 2)] for w in range(5)) <= 4)
-
             if last_shift == "Night" and not is_night_pool:
                 if num_days > 0:
                     for s in range(3): model.Add(roster[(n, 0, s)] == 0)
                 if num_days > 1:
                     for s in range(3): model.Add(roster[(n, 1, s)] == 0)
                         
-            # --- FIXED: DYNAMIC PAST-MAPPING & BLOCK RULES ---
-            w_minus_2 = 1 if (prior_days > 1 or prior_days == -1) else 0
+            # --- DYNAMIC NEGATIVE PRIOR DAYS MAPPING ---
             w_minus_1 = 1 if prior_days > 0 else 0
+            w_minus_2 = 1 if (prior_days > 1 or prior_days == -1) else 0
             
             def get_w(d_idx):
                 if d_idx == -1: return w_minus_1
@@ -376,20 +375,18 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(sum(internal_starts) - 1 <= extra_blocks)
                 fatigue_penalties.append(extra_blocks * 400)
                     
-                # Evaluates days -1 to num_days-2 safely creating blocks
                 for d_idx in range(-1, num_days - 1):
                     w0 = get_w(d_idx-1)
                     w1 = get_w(d_idx)
                     w2 = get_w(d_idx+1)
                     
-                    iso_off = model.NewBoolVar(f'iso_off_n{n}_d{d_idx}')
-                    model.Add(w0 - w1 + w2 - 1 <= iso_off)
-                    fatigue_penalties.append(iso_off * 20000)
+                    # HARD LAW: Banning Single Days Off permanently
+                    model.Add(w0 - w1 + w2 <= 1)
                     
+                    # SOFT PENALTY: Single Days On (Allows part-time math paradoxes to resolve safely)
                     iso_on = model.NewBoolVar(f'iso_on_n{n}_d{d_idx}')
                     model.Add(w1 - w0 - w2 <= iso_on)
                     fatigue_penalties.append(iso_on * 20000)
-            # -------------------------------------------------
 
             if not is_night_pool:
                 for d in range(0, num_days):
@@ -436,7 +433,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
     shift_map = {"am": 0, "pm": 1, "night": 2}
 
     for n in all_staff:
-        # --- FIXED: MIN-MAX FAIRNESS FOR REQUESTS (Quadratic Penalties) ---
+        # --- QUADRATIC FAIRNESS PENALTIES ---
         rdo_str = str(df.iloc[n]["Requested_RDOs"])
         req_rdos = []
         if rdo_str and rdo_str.lower() != 'nan':
@@ -448,20 +445,23 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 
         if req_rdos:
             rdo_missed_count = model.NewIntVar(0, len(req_rdos), f'rdo_miss_{n}')
-            model.Add(rdo_missed_count == sum(roster[(n, d, s)] for s in range(3) for d in req_rdos if (n, d, s) in roster))
+            worked_on_rdos = sum(roster[(n, d, s)] for s in range(3) for d in req_rdos if (n, d, s) in roster)
+            model.Add(rdo_missed_count == worked_on_rdos) 
+            
             rdo_miss_sq = model.NewIntVar(0, len(req_rdos)**2, f'rdo_sq_{n}')
             model.AddMultiplicationEquality(rdo_miss_sq, [rdo_missed_count, rdo_missed_count])
-            granular_penalties.append(rdo_miss_sq * 15)
+            granular_penalties.append(rdo_miss_sq * 100)
 
         pref_reqs = get_pref_requests(df.iloc[n].get("W1_Preferences", ""), df.iloc[n].get("W2_Preferences", ""))
         if pref_reqs:
             pref_missed_count = model.NewIntVar(0, len(pref_reqs), f'pref_miss_{n}')
             granted_prefs = sum(roster[(n, d, s)] for d, s in pref_reqs if (n, d, s) in roster)
             model.Add(pref_missed_count == len(pref_reqs) - granted_prefs)
+            
             pref_miss_sq = model.NewIntVar(0, len(pref_reqs)**2, f'pref_sq_{n}')
             model.AddMultiplicationEquality(pref_miss_sq, [pref_missed_count, pref_missed_count])
-            granular_penalties.append(pref_miss_sq * 10)
-        # ------------------------------------------------------------------
+            granular_penalties.append(pref_miss_sq * 100)
+        # -------------------------------------
 
         if not df.iloc[n].get("Night_Pool", False):
             pref = str(df.iloc[n].get("Preferred_Shift", "None")).strip()
@@ -519,6 +519,17 @@ def solve_roster(df, num_days, start_date, debug_flags):
             pm_totals.append(sum(1 for n in all_staff if (n, d, 1) in roster and solver.Value(roster[(n, d, 1)]) == 1))
             night_totals.append(sum(1 for n in all_staff if (n, d, 2) in roster and solver.Value(roster[(n, d, 2)]) == 1))
             
+        # --- ADDING THE EXPLICIT TOTALS ROW ---
+        summary_row_am_count = {"Staff ID": "📊 Ward AM Total", "Role": ""}
+        summary_row_pm_count = {"Staff ID": "📊 Ward PM Total", "Role": ""}
+        summary_row_night_count = {"Staff ID": "📊 Ward Night Total", "Role": ""}
+        for idx, h in enumerate(day_headers):
+            summary_row_am_count[h] = str(am_totals[idx])
+            summary_row_pm_count[h] = str(pm_totals[idx])
+            summary_row_night_count[h] = str(night_totals[idx])
+        roster_output.extend([summary_row_am_count, summary_row_pm_count, summary_row_night_count])
+        # --------------------------------------
+
         for n in all_staff:
             staff_row = {"Staff ID": df.iloc[n]["ID"], "Role": df.iloc[n]["Role"]}
             
@@ -530,11 +541,9 @@ def solve_roster(df, num_days, start_date, debug_flags):
             
             for d in all_days:
                 assigned_shift = "" 
-                
-                # --- FIXED: EXPLICIT VISUAL BRACKETS FOR NON-WARD DAYS ---
-                if d in study_days_list: assigned_shift = "[Study Leave]"
-                elif d in ext_days_list: assigned_shift = "[External/CNM]"
-                elif df.iloc[n].get("Entire_Roster_Leave", False) or d in valid_leave_list: assigned_shift = "[Leave]"
+                if d in study_days_list: assigned_shift = "--- Study ---"
+                elif d in ext_days_list: assigned_shift = "--- External ---"
+                elif df.iloc[n].get("Entire_Roster_Leave", False) or d in valid_leave_list: assigned_shift = "--- Leave ---"
                 else:
                     for s in range(3):
                         if (n, d, s) in roster and solver.Value(roster[(n, d, s)]) == 1:
@@ -552,8 +561,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 for val in rdo_str.split(","):
                     try:
                         d_rdo = int(val.strip()) - 1
-                        if 0 <= d_rdo < num_days:
-                            req_rdos.append(d_rdo)
+                        if 0 <= d_rdo < num_days: req_rdos.append(d_rdo)
                     except ValueError: pass
             
             rdos_granted = 0
@@ -565,12 +573,9 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     granted_rdo_strings.append(f"Day {d_rdo+1}")
             
             if req_rdos:
-                if rdos_granted > 0:
-                    rdo_tally = f"{rdos_granted}/{len(req_rdos)} ({', '.join(granted_rdo_strings)})"
-                else:
-                    rdo_tally = f"0/{len(req_rdos)}"
-            else:
-                rdo_tally = "N/A"
+                if rdos_granted > 0: rdo_tally = f"{rdos_granted}/{len(req_rdos)} ({', '.join(granted_rdo_strings)})"
+                else: rdo_tally = f"0/{len(req_rdos)}"
+            else: rdo_tally = "N/A"
             
             pref_reqs = get_pref_requests(df.iloc[n].get("W1_Preferences", ""), df.iloc[n].get("W2_Preferences", ""))
             prefs_granted = 0
@@ -582,12 +587,9 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     granted_pref_strings.append(f"{curr_date.strftime('%a')} {shift_names[t_shift]}")
             
             if pref_reqs:
-                if prefs_granted > 0:
-                    pref_tally = f"{prefs_granted}/{len(pref_reqs)} ({', '.join(granted_pref_strings)})"
-                else:
-                    pref_tally = f"0/{len(pref_reqs)}"
-            else:
-                pref_tally = "N/A"
+                if prefs_granted > 0: pref_tally = f"{prefs_granted}/{len(pref_reqs)} ({', '.join(granted_pref_strings)})"
+                else: pref_tally = f"0/{len(pref_reqs)}"
+            else: pref_tally = "N/A"
 
             is_fully_absent = df.iloc[n].get("Entire_Roster_Leave", False)
             if is_fully_absent:
