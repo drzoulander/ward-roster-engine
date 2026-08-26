@@ -109,6 +109,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
         pm_sum = sum(roster[(n, d, 1)] for n in all_staff)
         night_sum = sum(roster[(n, d, 2)] for n in all_staff)
         
+        # IRONCLAD CEILINGS
         model.Add(am_sum <= 5)
         model.Add(pm_sum <= 5)
         model.Add(night_sum <= 4)
@@ -351,9 +352,8 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 if num_days > 1:
                     for s in range(3): model.Add(roster[(n, 1, s)] == 0)
                         
-            # --- DYNAMIC NEGATIVE PRIOR DAYS MAPPING ---
             w_minus_1 = 1 if prior_days > 0 else 0
-            w_minus_2 = 1 if (prior_days > 1 or prior_days == -1) else 0
+            w_minus_2 = 1 if (prior_days > 1 or prior_days <= -1) else 0
             
             def get_w(d_idx):
                 if d_idx == -1: return w_minus_1
@@ -380,10 +380,10 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     w1 = get_w(d_idx)
                     w2 = get_w(d_idx+1)
                     
-                    # HARD LAW: Banning Single Days Off permanently
-                    model.Add(w0 - w1 + w2 <= 1)
+                    iso_off = model.NewBoolVar(f'iso_off_n{n}_d{d_idx}')
+                    model.Add(w0 - w1 + w2 - 1 <= iso_off)
+                    fatigue_penalties.append(iso_off * 20000)
                     
-                    # SOFT PENALTY: Single Days On (Allows part-time math paradoxes to resolve safely)
                     iso_on = model.NewBoolVar(f'iso_on_n{n}_d{d_idx}')
                     model.Add(w1 - w0 - w2 <= iso_on)
                     fatigue_penalties.append(iso_on * 20000)
@@ -433,7 +433,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
     shift_map = {"am": 0, "pm": 1, "night": 2}
 
     for n in all_staff:
-        # --- QUADRATIC FAIRNESS PENALTIES ---
         rdo_str = str(df.iloc[n]["Requested_RDOs"])
         req_rdos = []
         if rdo_str and rdo_str.lower() != 'nan':
@@ -461,7 +460,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             pref_miss_sq = model.NewIntVar(0, len(pref_reqs)**2, f'pref_sq_{n}')
             model.AddMultiplicationEquality(pref_miss_sq, [pref_missed_count, pref_missed_count])
             granular_penalties.append(pref_miss_sq * 100)
-        # -------------------------------------
 
         if not df.iloc[n].get("Night_Pool", False):
             pref = str(df.iloc[n].get("Preferred_Shift", "None")).strip()
@@ -519,7 +517,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             pm_totals.append(sum(1 for n in all_staff if (n, d, 1) in roster and solver.Value(roster[(n, d, 1)]) == 1))
             night_totals.append(sum(1 for n in all_staff if (n, d, 2) in roster and solver.Value(roster[(n, d, 2)]) == 1))
             
-        # --- ADDING THE EXPLICIT TOTALS ROW ---
         summary_row_am_count = {"Staff ID": "📊 Ward AM Total", "Role": ""}
         summary_row_pm_count = {"Staff ID": "📊 Ward PM Total", "Role": ""}
         summary_row_night_count = {"Staff ID": "📊 Ward Night Total", "Role": ""}
@@ -528,7 +525,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             summary_row_pm_count[h] = str(pm_totals[idx])
             summary_row_night_count[h] = str(night_totals[idx])
         roster_output.extend([summary_row_am_count, summary_row_pm_count, summary_row_night_count])
-        # --------------------------------------
 
         for n in all_staff:
             staff_row = {"Staff ID": df.iloc[n]["ID"], "Role": df.iloc[n]["Role"]}
@@ -832,4 +828,4 @@ if st.button("Generate Roster", type="primary"):
                     mime='text/csv'
                 )
         else:
-            st.error("Engine failed to generate. A hard mathematical paradox exists (usually caused by a requested RDO blocking a required EFT shift).")
+            st.error("Engine failed to generate. A hard mathematical paradox exists (e.g., impossible to meet the safe staffing floors with currently available staff, or a staff member's Approved Leave forces them to break their max-consecutive-shift limits).")
