@@ -229,8 +229,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
         study_days_set = set(parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))))
         ext_days_set = set(parse_days(str(df.iloc[n].get("External_Working_Days", ""))))
         
-        # All non-ward days force a 0 on the roster
-        unavailable_days = set(parse_days(leave_str)) | pd_days_set | ext_days_set | study_days_set
+        unavailable_days = set(parse_days(leave_str)) | study_days_set | pd_days_set | ext_days_set
                 
         if not debug_flags.get("ignore_leave"):
             for d in unavailable_days:
@@ -247,14 +246,14 @@ def solve_roster(df, num_days, start_date, debug_flags):
 
     fatigue_penalties = []
     
-    # --- EFT ADHERENCE (PD = 1:1, Study = Proportional) ---
+    # --- UPGRADED PROPORTIONAL EFT ---
     for n in all_staff:
         is_fully_absent = df.iloc[n].get("Entire_Roster_Leave", False)
         has_secondary = df.iloc[n]["Secondary_Role"] != "None" and df.iloc[n]["Secondary_EFT"] > 0
         
-        pd_days_set = set(parse_days(str(df.iloc[n].get("PD_Leave_Days", ""))))
-        study_days_set = set(parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))))
         valid_leave_list = parse_days(str(df.iloc[n]["Approved_Leave_Days"]))
+        study_days_set = set(parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))))
+        pd_days_set = set(parse_days(str(df.iloc[n].get("PD_Leave_Days", ""))))
         
         if is_fully_absent:
             final_shift_target = 0
@@ -268,20 +267,23 @@ def solve_roster(df, num_days, start_date, debug_flags):
             is_night_pool = df.iloc[n]["Night_Pool"]
             shift_length = 10.0 if is_night_pool else 8.0
             
-            base_shifts = (total_eft * 80.0 * (num_days / 14.0)) / shift_length
+            base_shifts_raw = (total_eft * 80.0 * (num_days / 14.0)) / shift_length
+            base_shifts_rounded = math.ceil(base_shifts_raw)
             
-            # Study Leave and Approved Leave proportionally reduce the availability calendar
+            # Study Leave acts proportionally with Approved Leave
             valid_leave_and_study = len([d for d in set(valid_leave_list) | study_days_set if 0 <= d < num_days])
             fraction_present = max(0.0, (num_days - valid_leave_and_study) / num_days)
-            clinical_shifts_after_leave = math.ceil(base_shifts * fraction_present)
             
-            # PD Leave is a strict 1-for-1 shift deduction
+            # Use floor + 0.5 for true accurate mathematical rounding!
+            clinical_shifts_after_leave = int(math.floor(base_shifts_rounded * fraction_present + 0.5))
+            
+            # PD Leave acts as a 1-for-1 deduction
             pd_count = len([d for d in pd_days_set if 0 <= d < num_days])
             final_shift_target = max(0, clinical_shifts_after_leave - pd_count)
             
             if has_secondary and not debug_flags.get("ignore_eft"):
-                sec_base = (secondary_eft * 80.0 * (num_days / 14.0)) / shift_length
-                sec_shifts_after_leave = math.ceil(sec_base * fraction_present)
+                sec_base_raw = (secondary_eft * 80.0 * (num_days / 14.0)) / shift_length
+                sec_shifts_after_leave = int(math.floor(math.ceil(sec_base_raw) * fraction_present + 0.5))
                 sec_shift_target = min(sec_shifts_after_leave, final_shift_target)
                 
                 actual_sec_shifts = sum(role_secondary[(n, d, s)] for d in range(num_days) for s in range(3) if (n, d, s) in role_secondary)
@@ -311,8 +313,8 @@ def solve_roster(df, num_days, start_date, debug_flags):
             study_days_set = set(parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))))
             ext_days_set = set(parse_days(str(df.iloc[n].get("External_Working_Days", ""))))
             
-            # Virtual work days only include PD and External
-            virtual_work_days = pd_days_set | ext_days_set
+            # Virtual work active shifts ONLY includes PD + External
+            virtual_work_days_active = pd_days_set | ext_days_set
             
             for d in range(num_days - 1):
                 model.AddImplication(roster[(n, d, 2)], roster[(n, d+1, 0)].Not())
@@ -322,28 +324,25 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 model.Add(roster[(n, 0, 0)] == 0)
                 model.Add(roster[(n, 0, 1)] == 0)
                 
-            # Night Shift Bans (Applies to both PD and Study Leave)
-            for sd in pd_days_set | study_days_set:
+            # Both PD and Study Leave Ban Preceding Nights
+            for sd in (pd_days_set | study_days_set):
                 if 0 <= sd < num_days:
-                    if sd - 1 >= 0:
-                        model.Add(roster[(n, sd-1, 2)] == 0)
-                    if sd - 2 >= 0:
-                        model.Add(roster[(n, sd-2, 2)] == 0)
+                    if sd - 1 >= 0: model.Add(roster[(n, sd-1, 2)] == 0)
+                    if sd - 2 >= 0: model.Add(roster[(n, sd-2, 2)] == 0)
                 
             shift_length = 10.0 if is_night_pool else 8.0
             total_eft_fatigue = df.iloc[n]["EFT"] + (df.iloc[n]["Secondary_EFT"] if df.iloc[n]["Secondary_Role"] != "None" else 0.0)
             base_shifts_fatigue = math.ceil((total_eft_fatigue * 80.0) / shift_length)
             
+            # Max Consec is completely unaffected by Study Leave
             ext_count = len([d for d in ext_days_set if 0 <= d < num_days])
             pd_count = len([d for d in pd_days_set if 0 <= d < num_days])
-            
-            # Max Consec uses Virtual Work Days (PD + External), but NOT new Study Leave
             total_shifts_for_fatigue = base_shifts_fatigue + ext_count + pd_count
             max_consec = int((total_shifts_for_fatigue / 2) + 1)
             
             for d in range(num_days - max_consec):
                 ward_shifts = sum(roster[(n, d+w, s)] for w in range(max_consec + 1) for s in range(3) if (n, d+w, s) in roster)
-                virtual_shifts = sum(1 for w in range(max_consec + 1) if (d+w) in virtual_work_days)
+                virtual_shifts = sum(1 for w in range(max_consec + 1) if (d+w) in virtual_work_days_active)
                 if virtual_shifts <= max_consec:
                     model.Add(ward_shifts <= max_consec - virtual_shifts)
                 else:
@@ -357,7 +356,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 remaining_allowed = max(0, max_consec - prior_days)
                 if days_to_check > 0 and num_days >= days_to_check:
                     ward_boundary = sum(roster[(n, w, s)] for w in range(days_to_check) for s in range(3) if (n, w, s) in roster)
-                    virtual_boundary = sum(1 for w in range(days_to_check) if w in virtual_work_days)
+                    virtual_boundary = sum(1 for w in range(days_to_check) if w in virtual_work_days_active)
                     if virtual_boundary <= remaining_allowed:
                         model.Add(ward_boundary <= remaining_allowed - virtual_boundary)
                     else:
@@ -372,18 +371,24 @@ def solve_roster(df, num_days, start_date, debug_flags):
             w_minus_1 = 1 if prior_days > 0 else 0
             w_minus_2 = 1 if (prior_days > 1 or prior_days <= -1) else 0
             
-            def get_w(d_idx):
+            def get_w_active(d_idx):
                 if d_idx == -1: return w_minus_1
                 if d_idx == -2: return w_minus_2
                 if d_idx >= num_days: return 0 
-                return sum(roster[(n, d_idx, s)] for s in range(3)) + (1 if d_idx in virtual_work_days else 0)
+                return sum(roster[(n, d_idx, s)] for s in range(3)) + (1 if d_idx in virtual_work_days_active else 0)
+
+            def get_w_rest(d_idx):
+                if d_idx == -1: return w_minus_1
+                if d_idx == -2: return w_minus_2
+                if d_idx >= num_days: return 0 
+                return sum(roster[(n, d_idx, s)] for s in range(3)) + (1 if d_idx in (virtual_work_days_active | study_days_set) else 0)
 
             allow_fragmented = df.iloc[n]["Allow_Fragmented_Shifts"]
             if not allow_fragmented:
                 internal_starts = []
                 for d in range(0, num_days):
-                    w_yest = get_w(d-1)
-                    w_tod = get_w(d)
+                    w_yest = get_w_active(d-1)
+                    w_tod = get_w_active(d)
                     is_start = model.NewBoolVar(f'internal_start_{n}_day_{d}')
                     model.Add(w_tod - w_yest <= is_start)
                     internal_starts.append(is_start)
@@ -393,27 +398,31 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 fatigue_penalties.append(extra_blocks * 400)
                     
                 for d_idx in range(-1, num_days - 1):
-                    w0 = get_w(d_idx-1)
-                    w1 = get_w(d_idx)
-                    w2 = get_w(d_idx+1)
+                    w0_rest = get_w_rest(d_idx-1)
+                    w1_rest = get_w_rest(d_idx)
+                    w2_rest = get_w_rest(d_idx+1)
                     
+                    w1_active = get_w_active(d_idx)
+                    
+                    # PSEUDO-HARD LAW: Study Leave prevents single days off!
                     iso_off = model.NewBoolVar(f'iso_off_n{n}_d{d_idx}')
-                    model.Add(w0 - w1 + w2 - 1 <= iso_off)
+                    model.Add(w0_rest - w1_rest + w2_rest - 1 <= iso_off)
                     fatigue_penalties.append(iso_off * 20000)
                     
+                    # PSEUDO-HARD LAW: Study Leave DOES NOT penalize an isolated day on!
                     iso_on = model.NewBoolVar(f'iso_on_n{n}_d{d_idx}')
-                    model.Add(w1 - w0 - w2 <= iso_on)
+                    model.Add(w1_active - w0_rest - w2_rest <= iso_on)
                     fatigue_penalties.append(iso_on * 20000)
 
             if not is_night_pool:
                 for d in range(0, num_days):
-                    w_yest = get_w(d-1)
+                    w_yest = get_w_active(d-1)
                     am_tod = roster[(n, d, 0)]
                     bad_start = model.NewBoolVar(f'bad_start_n{n}_d{d}')
                     model.Add(am_tod - w_yest <= bad_start)
                     fatigue_penalties.append(bad_start * 8)
                     
-                    w_tom = get_w(d+1)
+                    w_tom = get_w_active(d+1)
                     pm_tod = roster[(n, d, 1)]
                     bad_end = model.NewBoolVar(f'bad_end_n{n}_d{d}')
                     model.Add(pm_tod - w_tom <= bad_end)
@@ -434,13 +443,14 @@ def solve_roster(df, num_days, start_date, debug_flags):
             model.Add(roster[(n, d, 1)] + roster[(n, d+1, 0)] - 1 <= is_late_early)
             late_earlies.append(is_late_early)
             
-        # Only PD Leave triggers a late-early penalty (since new Study is a protected day off)
         pd_days_set = set(parse_days(str(df.iloc[n].get("PD_Leave_Days", ""))))
-        for pd_d in pd_days_set:
-            if pd_d - 1 >= 0:
-                is_le_pd = model.NewBoolVar(f'le_pd_{n}_d{pd_d}')
-                model.Add(roster[(n, pd_d-1, 1)] <= is_le_pd)
-                late_earlies.append(is_le_pd)
+        study_days_set = set(parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))))
+        
+        for sd in (pd_days_set | study_days_set):
+            if sd - 1 >= 0:
+                is_le_study = model.NewBoolVar(f'le_study_{n}_d{sd}')
+                model.Add(roster[(n, sd-1, 1)] <= is_le_study)
+                late_earlies.append(is_le_study)
             
         excess_le = model.NewIntVar(0, 14, f'excess_le_{n}')
         model.Add(sum(late_earlies) - (num_days // 14) <= excess_le)
@@ -557,7 +567,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
             for d in all_days:
                 assigned_shift = "" 
                 if d in pd_days_list: assigned_shift = "--- PD Leave ---"
-                elif d in study_days_list: assigned_shift = "--- Study Leave ---"
+                elif d in study_days_list: assigned_shift = "--- Study ---"
                 elif d in ext_days_list: assigned_shift = "--- External ---"
                 elif df.iloc[n].get("Entire_Roster_Leave", False) or d in valid_leave_list: assigned_shift = "--- Leave ---"
                 else:
@@ -613,11 +623,12 @@ def solve_roster(df, num_days, start_date, debug_flags):
             else:
                 total_eft = df.iloc[n]["EFT"] + (df.iloc[n]["Secondary_EFT"] if df.iloc[n]["Secondary_Role"] != "None" else 0.0)
                 shift_length = 10.0 if df.iloc[n]["Night_Pool"] else 8.0
-                base_shifts = (total_eft * 80.0 * (num_days / 14.0)) / shift_length
+                base_shifts_raw = (total_eft * 80.0 * (num_days / 14.0)) / shift_length
+                base_shifts_rounded = math.ceil(base_shifts_raw)
                 
-                valid_leave_days = len([d for d in set(valid_leave_list) | set(study_days_list) if 0 <= d < num_days])
-                fraction_present = max(0.0, (num_days - valid_leave_days) / num_days)
-                clinical_shifts = math.ceil(base_shifts * fraction_present)
+                valid_leave_and_study = len([d for d in set(valid_leave_list) | set(study_days_list) if 0 <= d < num_days])
+                fraction_present = max(0.0, (num_days - valid_leave_and_study) / num_days)
+                clinical_shifts = int(math.floor(base_shifts_rounded * fraction_present + 0.5))
                 
                 pd_count = len([d for d in pd_days_list if 0 <= d < num_days])
                 target_shifts = max(0, clinical_shifts - pd_count)
@@ -734,14 +745,16 @@ for _, row in st.session_state.staff_df.iterrows():
     
     total_eft = row["EFT"] + row["Secondary_EFT"]
     shift_len = 10.0 if row["Night_Pool"] else 8.0
-    base_shifts = (total_eft * 80.0) / shift_len
+    base_shifts_raw = (total_eft * 80.0) / shift_len
+    base_shifts_rounded = math.ceil(base_shifts_raw)
     
     valid_leave = parse_days_length(row["Approved_Leave_Days"])
     study_leave_new = parse_days_length(row["Study_Leave_Days"])
     pd_leave = parse_days_length(row["PD_Leave_Days"])
     
     fraction = max(0.0, (14 - valid_leave - study_leave_new) / 14)
-    target = max(0, math.ceil(base_shifts * fraction) - pd_leave)
+    clinical = int(math.floor(base_shifts_rounded * fraction + 0.5))
+    target = max(0, clinical - pd_leave)
     
     if row["Night_Pool"]: total_night_shifts_needed += target
     else: total_day_shifts_needed += target
