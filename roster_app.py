@@ -246,7 +246,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
 
     fatigue_penalties = []
     
-    # --- FIXED: EXACT 1-FOR-1 EFT DEDUCTIONS FOR STUDY AND PD ---
     for n in all_staff:
         is_fully_absent = df.iloc[n].get("Entire_Roster_Leave", False)
         has_secondary = df.iloc[n]["Secondary_Role"] != "None" and df.iloc[n]["Secondary_EFT"] > 0
@@ -254,7 +253,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
         valid_leave_list = parse_days(str(df.iloc[n]["Approved_Leave_Days"]))
         study_days_set = set(parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))))
         pd_days_set = set(parse_days(str(df.iloc[n].get("PD_Leave_Days", ""))))
-        ext_days_set = set(parse_days(str(df.iloc[n].get("External_Working_Days", ""))))
         
         if is_fully_absent:
             final_shift_target = 0
@@ -271,14 +269,11 @@ def solve_roster(df, num_days, start_date, debug_flags):
             base_shifts_raw = (total_eft * 80.0 * (num_days / 14.0)) / shift_length
             base_shifts_rounded = math.ceil(base_shifts_raw)
             
-            # ONLY Approved Leave reduces the proportional fraction
             valid_leave_days = len([d for d in valid_leave_list if 0 <= d < num_days])
             fraction_present = max(0.0, (num_days - valid_leave_days) / num_days)
             
-            # True rounding using floor + 0.5
             clinical_shifts_after_leave = int(math.floor(base_shifts_rounded * fraction_present + 0.5))
             
-            # Both PD and Study Leave subtract 1-for-1 directly from the required shifts
             study_count = len([d for d in study_days_set if 0 <= d < num_days])
             pd_count = len([d for d in pd_days_set if 0 <= d < num_days])
             final_shift_target = max(0, clinical_shifts_after_leave - pd_count - study_count)
@@ -315,21 +310,16 @@ def solve_roster(df, num_days, start_date, debug_flags):
             study_days_set = set(parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))))
             ext_days_set = set(parse_days(str(df.iloc[n].get("External_Working_Days", ""))))
             
-            # --- FIXED: 29-HOUR DAY-TO-NIGHT BAN ---
             for d in range(num_days - 1):
-                # If working AM or PM today, CANNOT work Night tomorrow
                 model.AddImplication(roster[(n, d, 0)], roster[(n, d+1, 2)].Not())
                 model.AddImplication(roster[(n, d, 1)], roster[(n, d+1, 2)].Not())
                 
-            # Connect the 29-hour rule to the prior week's finishing shift
             if last_shift in ["AM", "PM", "NIGHT"]:
                 model.Add(roster[(n, 0, 2)] == 0)
                 if last_shift == "NIGHT":
                     model.Add(roster[(n, 0, 0)] == 0)
                     model.Add(roster[(n, 0, 1)] == 0)
-            # ---------------------------------------
                 
-            # Both PD and Study Leave Ban Preceding Nights
             for sd in (pd_days_set | study_days_set):
                 if 0 <= sd < num_days:
                     if sd - 1 >= 0: model.Add(roster[(n, sd-1, 2)] == 0)
@@ -353,7 +343,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 if num_days > 1:
                     for s in range(3): model.Add(roster[(n, 1, s)] == 0)
                         
-            # --- FIXED: MAX CONSECUTIVE "SANDWICH" ENGINE ---
             virtual_work_days_active = pd_days_set | ext_days_set
             
             is_active_vars = []
@@ -373,13 +362,10 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     model.Add(duty_var == act_var)
                 is_duty_vars.append(duty_var)
                 
-            # Limit the span between the FIRST active day and LAST active day in any continuous block
             for A in range(num_days):
                 for B in range(A + max_consec, num_days):
-                    # If A is active and B is active, they cannot be connected entirely by Duty/Study days
                     model.AddBoolOr([is_active_vars[A].Not(), is_active_vars[B].Not()] + [is_duty_vars[k].Not() for k in range(A+1, B)])
 
-            # Apply identical span logic linking to the prior roster
             if prior_days > 0:
                 for B in range(num_days):
                     if B + prior_days >= max_consec:
@@ -414,16 +400,13 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     
                     w1_active = past_active(d_idx) if d_idx < 0 else is_active_vars[d_idx]
                     
-                    # No Single Day Off between any duty days (Study Leave protects continuity)
                     iso_off = model.NewBoolVar(f'iso_off_n{n}_d{d_idx}')
                     model.Add(w0_duty - w1_duty + w2_duty - 1 <= iso_off)
                     fatigue_penalties.append(iso_off * 20000)
                     
-                    # No Single Day On (An isolated Active Day is penalized, but an isolated Study Day is perfectly legal)
                     iso_on = model.NewBoolVar(f'iso_on_n{n}_d{d_idx}')
                     model.Add(w1_active - w0_duty - w2_duty <= iso_on)
                     fatigue_penalties.append(iso_on * 20000)
-            # --------------------------------------------------------
 
             if not is_night_pool:
                 for d in range(0, num_days):
@@ -433,7 +416,9 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     model.Add(am_tod - w_yest <= bad_start)
                     fatigue_penalties.append(bad_start * 8)
                     
-                    w_tom = past_active(d+1) if d+1 < 0 else is_active_vars[d+1]
+                    # --- FIXED BOUNDARY CHECK FOR THE "BAD END" RULE ---
+                    w_tom = 0 if d+1 >= num_days else is_active_vars[d+1]
+                    # ---------------------------------------------------
                     pm_tod = roster[(n, d, 1)]
                     bad_end = model.NewBoolVar(f'bad_end_n{n}_d{d}')
                     model.Add(pm_tod - w_tom <= bad_end)
