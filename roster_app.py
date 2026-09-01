@@ -50,7 +50,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
         try: return [int(x.strip()) - 1 for x in day_string.split(",")]
         except ValueError: return []
         
-    # --- UPGRADED: "DAY-ONLY" PREFERENCE PARSER ---
     def get_pref_requests(w1_str, w2_str):
         reqs = []
         shift_map = {"am": 0, "pm": 1, "night": 2}
@@ -70,7 +69,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                                     reqs.append((d, mapped_shift))
                                     break
         return reqs
-    # ----------------------------------------------
     
     roster = {}
     role_primary = {}
@@ -116,22 +114,26 @@ def solve_roster(df, num_days, start_date, debug_flags):
         model.Add(pm_sum <= 5)
         model.Add(night_sum <= 4)
         
+        # --- UPGRADED: AM SHIFT PREFERENCE DURING SHORTAGES ---
+        # Track missing shifts regardless of the floor constraint so the solver gracefully prioritizes shifts
+        missing_am = model.NewIntVar(0, 5, f'missing_am_d{d}')
+        model.Add(missing_am == 5 - am_sum)
+        staffing_level_penalties.append(missing_am * (550 if (is_weekend or is_monday or is_pub_hol) else 250))
+            
+        missing_pm = model.NewIntVar(0, 5, f'missing_pm_d{d}')
+        model.Add(missing_pm == 5 - pm_sum)
+        staffing_level_penalties.append(missing_pm * (500 if (is_weekend or is_friday or is_pub_hol) else 200))
+            
+        missing_night = model.NewIntVar(0, 4, f'missing_night_d{d}')
+        model.Add(missing_night == 4 - night_sum)
+        staffing_level_penalties.append(missing_night * (500 if (is_weekend or is_pub_hol) else 200))
+        
         if not debug_flags.get("ignore_coverage"):
             model.Add(am_sum >= 4)
-            missing_am = model.NewIntVar(0, 1, f'missing_am_d{d}')
-            model.Add(missing_am == 5 - am_sum)
-            staffing_level_penalties.append(missing_am * (500 if (is_weekend or is_monday or is_pub_hol) else 200))
-                
             model.Add(pm_sum >= 4)
-            missing_pm = model.NewIntVar(0, 1, f'missing_pm_d{d}')
-            model.Add(missing_pm == 5 - pm_sum)
-            staffing_level_penalties.append(missing_pm * (500 if (is_weekend or is_friday or is_pub_hol) else 200))
-                
             target_night = 4 if (is_weekend or is_pub_hol) else 3
-            model.Add(night_sum >= 3)
-            missing_night = model.NewIntVar(0, 1, f'missing_night_d{d}')
-            model.Add(missing_night == 4 - night_sum)
-            staffing_level_penalties.append(missing_night * (500 if (is_weekend or is_pub_hol) else 200))
+            model.Add(night_sum >= target_night)
+        # ------------------------------------------------------
             
         for s in range(3):
             en_count = sum(roster[(n, d, s)] for n in all_staff if df.iloc[n]["Role"] == "EN/Learner")
@@ -320,10 +322,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             if last_shift in ["AM", "PM"]:
                 model.Add(roster[(n, 0, 2)] == 0) 
                 
-            if last_shift == "NIGHT":
-                model.Add(roster[(n, 0, 0)] == 0)
-                model.Add(roster[(n, 0, 1)] == 0)
-                
             for sd in (pd_days_set | study_days_set):
                 if 0 <= sd < num_days:
                     if sd - 1 >= 0: model.Add(roster[(n, sd-1, 2)] == 0)
@@ -485,7 +483,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             model.AddMultiplicationEquality(rdo_miss_sq, [rdo_missed_count, rdo_missed_count])
             granular_penalties.append(rdo_miss_sq * 100)
 
-        # --- UPGRADED: "DAY-ONLY" GRANTED PREFERENCE TRACKING ---
         pref_reqs = get_pref_requests(df.iloc[n].get("W1_Preferences", ""), df.iloc[n].get("W2_Preferences", ""))
         if pref_reqs:
             pref_missed_count = model.NewIntVar(0, len(pref_reqs), f'pref_miss_{n}')
@@ -506,7 +503,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
             pref_miss_sq = model.NewIntVar(0, len(pref_reqs)**2, f'pref_sq_{n}')
             model.AddMultiplicationEquality(pref_miss_sq, [pref_missed_count, pref_missed_count])
             granular_penalties.append(pref_miss_sq * 100)
-        # --------------------------------------------------------
 
         if not df.iloc[n].get("Night_Pool", False):
             pref = str(df.iloc[n].get("Preferred_Shift", "None")).strip()
@@ -622,7 +618,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 else: rdo_tally = f"0/{len(req_rdos)}"
             else: rdo_tally = "N/A"
             
-            # --- UPGRADED: "DAY-ONLY" TALLY RENDERER ---
             pref_reqs = get_pref_requests(df.iloc[n].get("W1_Preferences", ""), df.iloc[n].get("W2_Preferences", ""))
             prefs_granted = 0
             granted_pref_strings = []
@@ -639,7 +634,6 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     if (n, t_day, t_shift) in roster and solver.Value(roster[(n, t_day, t_shift)]) == 1:
                         prefs_granted += 1
                         granted_pref_strings.append(f"{day_str} {shift_names[t_shift]}")
-            # -------------------------------------------
             
             if pref_reqs:
                 if prefs_granted > 0: pref_tally = f"{prefs_granted}/{len(pref_reqs)} ({', '.join(granted_pref_strings)})"
@@ -769,12 +763,21 @@ def parse_days_length(day_string):
 
 total_day_shifts_needed = 0
 total_night_shifts_needed = 0
+total_night_eft = 0.0
 
 for _, row in st.session_state.staff_df.iterrows():
     if row["Entire_Roster_Leave"]: continue
     
-    total_eft = row["EFT"] + row["Secondary_EFT"]
-    shift_len = 10.0 if row["Night_Pool"] else 8.0
+    primary_eft = float(row["EFT"])
+    secondary_eft = float(row["Secondary_EFT"])
+    total_eft = primary_eft + secondary_eft
+    
+    if row["Night_Pool"]:
+        total_night_eft += total_eft
+        shift_len = 10.0 
+    else:
+        shift_len = 8.0
+        
     base_shifts_raw = (total_eft * 80.0) / shift_len
     base_shifts_rounded = math.ceil(base_shifts_raw)
     
@@ -792,6 +795,19 @@ for _, row in st.session_state.staff_df.iterrows():
 col_a, col_b, col_c = st.columns(3)
 col_a.metric("Total Day Shifts Contracted", total_day_shifts_needed, delta=f"{140 - total_day_shifts_needed} Empty Ward Slots", delta_color="normal" if 140 >= total_day_shifts_needed else "inverse")
 col_b.metric("Total Night Shifts Contracted", total_night_shifts_needed, delta=f"{56 - total_night_shifts_needed} Empty Ward Slots", delta_color="normal" if 56 >= total_night_shifts_needed else "inverse")
+
+if total_night_eft > 6.3:
+    eft_color = "🟢"
+    eft_status = "Optimal"
+elif total_night_eft >= 5.5:
+    eft_color = "🟠"
+    eft_status = "Borderline"
+else:
+    eft_color = "🔴"
+    eft_status = "Critical Shortage"
+    
+col_c.metric(f"{eft_color} Night Pool Capacity", f"{total_night_eft:.2f} EFT", delta=eft_status, delta_color="off")
+
 if total_day_shifts_needed > 140 or total_night_shifts_needed > 56:
     st.error("🚨 **WARNING: Ward Over-Contracted!** Your staff legally require more shifts than the physical ward can hold. You MUST use the Troubleshooter to bypass the shift ceilings, or the roster will crash.")
 # -----------------------------------
