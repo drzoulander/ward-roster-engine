@@ -50,6 +50,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
         try: return [int(x.strip()) - 1 for x in day_string.split(",")]
         except ValueError: return []
         
+    # --- UPGRADED: "DAY-ONLY" PREFERENCE PARSER ---
     def get_pref_requests(w1_str, w2_str):
         reqs = []
         shift_map = {"am": 0, "pm": 1, "night": 2}
@@ -57,17 +58,19 @@ def solve_roster(df, num_days, start_date, debug_flags):
             if not p_str or p_str == 'nan': continue
             for req in [x.strip() for x in p_str.split(",")]:
                 parts = req.split()
-                if len(parts) >= 2:
+                if len(parts) >= 1:
                     day_abbrev = parts[0][:3].lower()
-                    shift_val = parts[1].lower()
-                    if shift_val in shift_map:
+                    shift_val = parts[1].lower() if len(parts) >= 2 else "any"
+                    if shift_val in shift_map or shift_val == "any":
                         for d in range(w_idx * 7, (w_idx + 1) * 7):
                             if d < num_days:
                                 curr_date = start_date + datetime.timedelta(days=d)
                                 if curr_date.strftime("%a").lower() == day_abbrev:
-                                    reqs.append((d, shift_map[shift_val]))
+                                    mapped_shift = shift_map[shift_val] if shift_val in shift_map else "any"
+                                    reqs.append((d, mapped_shift))
                                     break
         return reqs
+    # ----------------------------------------------
     
     roster = {}
     role_primary = {}
@@ -310,19 +313,16 @@ def solve_roster(df, num_days, start_date, debug_flags):
             study_days_set = set(parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))))
             ext_days_set = set(parse_days(str(df.iloc[n].get("External_Working_Days", ""))))
             
-            # --- FIXED: ACCURATE DAY-TO-NIGHT TRANSITION BANS ---
             for d in range(num_days - 1):
-                model.AddImplication(roster[(n, d, 0)], roster[(n, d+1, 2)].Not()) # AM -> Night tomorrow banned
-                model.AddImplication(roster[(n, d, 1)], roster[(n, d+1, 2)].Not()) # PM -> Night tomorrow banned
+                model.AddImplication(roster[(n, d, 0)], roster[(n, d+1, 2)].Not()) 
+                model.AddImplication(roster[(n, d, 1)], roster[(n, d+1, 2)].Not()) 
                 
             if last_shift in ["AM", "PM"]:
-                model.Add(roster[(n, 0, 2)] == 0) # Prior Day Shift -> Day 0 Night banned
+                model.Add(roster[(n, 0, 2)] == 0) 
                 
             if last_shift == "NIGHT":
                 model.Add(roster[(n, 0, 0)] == 0)
                 model.Add(roster[(n, 0, 1)] == 0)
-                # NOTE: We DO NOT ban Day 0 Night here, restoring massive capacity to the Night Pool
-            # ----------------------------------------------------
                 
             for sd in (pd_days_set | study_days_set):
                 if 0 <= sd < num_days:
@@ -375,14 +375,13 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     if B + prior_days >= max_consec:
                         model.AddBoolOr([is_active_vars[B].Not()] + [is_duty_vars[k].Not() for k in range(0, B)])
             
-            # --- FIXED: FLAWLESS NEGATIVE PRIOR DAYS MAPPING ---
             w_minus_1 = 1 if prior_days > 0 else 0
             if prior_days > 1:
                 w_minus_2 = 1
             elif prior_days == -1:
-                w_minus_2 = 1  # Exactly 1 day off means Day -1 was Off, Day -2 was On
+                w_minus_2 = 1 
             else:
-                w_minus_2 = 0  # 0 or <= -2 means Day -2 was Off
+                w_minus_2 = 0
             
             def past_active(d_idx):
                 if d_idx == -1: return w_minus_1
@@ -391,8 +390,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
             
             def past_duty(d_idx):
                 return past_active(d_idx)
-            # ---------------------------------------------------
-
+            
             allow_fragmented = df.iloc[n]["Allow_Fragmented_Shifts"]
             if not allow_fragmented:
                 internal_starts = []
@@ -487,15 +485,28 @@ def solve_roster(df, num_days, start_date, debug_flags):
             model.AddMultiplicationEquality(rdo_miss_sq, [rdo_missed_count, rdo_missed_count])
             granular_penalties.append(rdo_miss_sq * 100)
 
+        # --- UPGRADED: "DAY-ONLY" GRANTED PREFERENCE TRACKING ---
         pref_reqs = get_pref_requests(df.iloc[n].get("W1_Preferences", ""), df.iloc[n].get("W2_Preferences", ""))
         if pref_reqs:
             pref_missed_count = model.NewIntVar(0, len(pref_reqs), f'pref_miss_{n}')
-            granted_prefs = sum(roster[(n, d, s)] for d, s in pref_reqs if (n, d, s) in roster)
+            
+            granted_vars = []
+            for t_day, t_shift in pref_reqs:
+                if t_shift == "any":
+                    worked_any = model.NewBoolVar(f'worked_any_{n}_{t_day}')
+                    model.Add(worked_any == sum(roster[(n, t_day, s)] for s in range(3) if (n, t_day, s) in roster))
+                    granted_vars.append(worked_any)
+                else:
+                    if (n, t_day, t_shift) in roster:
+                        granted_vars.append(roster[(n, t_day, t_shift)])
+                        
+            granted_prefs = sum(granted_vars)
             model.Add(pref_missed_count == len(pref_reqs) - granted_prefs)
             
             pref_miss_sq = model.NewIntVar(0, len(pref_reqs)**2, f'pref_sq_{n}')
             model.AddMultiplicationEquality(pref_miss_sq, [pref_missed_count, pref_missed_count])
             granular_penalties.append(pref_miss_sq * 100)
+        # --------------------------------------------------------
 
         if not df.iloc[n].get("Night_Pool", False):
             pref = str(df.iloc[n].get("Preferred_Shift", "None")).strip()
@@ -611,14 +622,24 @@ def solve_roster(df, num_days, start_date, debug_flags):
                 else: rdo_tally = f"0/{len(req_rdos)}"
             else: rdo_tally = "N/A"
             
+            # --- UPGRADED: "DAY-ONLY" TALLY RENDERER ---
             pref_reqs = get_pref_requests(df.iloc[n].get("W1_Preferences", ""), df.iloc[n].get("W2_Preferences", ""))
             prefs_granted = 0
             granted_pref_strings = []
             for t_day, t_shift in pref_reqs:
-                if (n, t_day, t_shift) in roster and solver.Value(roster[(n, t_day, t_shift)]) == 1:
-                    prefs_granted += 1
-                    curr_date = start_date + datetime.timedelta(days=t_day)
-                    granted_pref_strings.append(f"{curr_date.strftime('%a')} {shift_names[t_shift]}")
+                curr_date = start_date + datetime.timedelta(days=t_day)
+                day_str = curr_date.strftime('%a')
+                
+                if t_shift == "any":
+                    actual_worked_shifts = [s for s in range(3) if (n, t_day, s) in roster and solver.Value(roster[(n, t_day, s)]) == 1]
+                    if actual_worked_shifts:
+                        prefs_granted += 1
+                        granted_pref_strings.append(f"{day_str} {shift_names[actual_worked_shifts[0]]}")
+                else:
+                    if (n, t_day, t_shift) in roster and solver.Value(roster[(n, t_day, t_shift)]) == 1:
+                        prefs_granted += 1
+                        granted_pref_strings.append(f"{day_str} {shift_names[t_shift]}")
+            # -------------------------------------------
             
             if pref_reqs:
                 if prefs_granted > 0: pref_tally = f"{prefs_granted}/{len(pref_reqs)} ({', '.join(granted_pref_strings)})"
