@@ -310,15 +310,19 @@ def solve_roster(df, num_days, start_date, debug_flags):
             study_days_set = set(parse_days(str(df.iloc[n].get("Study_Leave_Days", ""))))
             ext_days_set = set(parse_days(str(df.iloc[n].get("External_Working_Days", ""))))
             
+            # --- FIXED: ACCURATE DAY-TO-NIGHT TRANSITION BANS ---
             for d in range(num_days - 1):
-                model.AddImplication(roster[(n, d, 0)], roster[(n, d+1, 2)].Not())
-                model.AddImplication(roster[(n, d, 1)], roster[(n, d+1, 2)].Not())
+                model.AddImplication(roster[(n, d, 0)], roster[(n, d+1, 2)].Not()) # AM -> Night tomorrow banned
+                model.AddImplication(roster[(n, d, 1)], roster[(n, d+1, 2)].Not()) # PM -> Night tomorrow banned
                 
-            if last_shift in ["AM", "PM", "NIGHT"]:
-                model.Add(roster[(n, 0, 2)] == 0)
-                if last_shift == "NIGHT":
-                    model.Add(roster[(n, 0, 0)] == 0)
-                    model.Add(roster[(n, 0, 1)] == 0)
+            if last_shift in ["AM", "PM"]:
+                model.Add(roster[(n, 0, 2)] == 0) # Prior Day Shift -> Day 0 Night banned
+                
+            if last_shift == "NIGHT":
+                model.Add(roster[(n, 0, 0)] == 0)
+                model.Add(roster[(n, 0, 1)] == 0)
+                # NOTE: We DO NOT ban Day 0 Night here, restoring massive capacity to the Night Pool
+            # ----------------------------------------------------
                 
             for sd in (pd_days_set | study_days_set):
                 if 0 <= sd < num_days:
@@ -371,14 +375,24 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     if B + prior_days >= max_consec:
                         model.AddBoolOr([is_active_vars[B].Not()] + [is_duty_vars[k].Not() for k in range(0, B)])
             
-            def past_duty(d_idx):
-                if prior_days > 0: return 1 if d_idx >= -prior_days else 0
-                elif prior_days < 0: return 0 if d_idx >= prior_days else 1
-                return 0
+            # --- FIXED: FLAWLESS NEGATIVE PRIOR DAYS MAPPING ---
+            w_minus_1 = 1 if prior_days > 0 else 0
+            if prior_days > 1:
+                w_minus_2 = 1
+            elif prior_days == -1:
+                w_minus_2 = 1  # Exactly 1 day off means Day -1 was Off, Day -2 was On
+            else:
+                w_minus_2 = 0  # 0 or <= -2 means Day -2 was Off
             
             def past_active(d_idx):
-                return past_duty(d_idx)
+                if d_idx == -1: return w_minus_1
+                if d_idx == -2: return w_minus_2
+                return 0
             
+            def past_duty(d_idx):
+                return past_active(d_idx)
+            # ---------------------------------------------------
+
             allow_fragmented = df.iloc[n]["Allow_Fragmented_Shifts"]
             if not allow_fragmented:
                 internal_starts = []
@@ -416,9 +430,7 @@ def solve_roster(df, num_days, start_date, debug_flags):
                     model.Add(am_tod - w_yest <= bad_start)
                     fatigue_penalties.append(bad_start * 8)
                     
-                    # --- FIXED BOUNDARY CHECK FOR THE "BAD END" RULE ---
                     w_tom = 0 if d+1 >= num_days else is_active_vars[d+1]
-                    # ---------------------------------------------------
                     pm_tod = roster[(n, d, 1)]
                     bad_end = model.NewBoolVar(f'bad_end_n{n}_d{d}')
                     model.Add(pm_tod - w_tom <= bad_end)
